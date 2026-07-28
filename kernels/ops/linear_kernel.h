@@ -61,6 +61,17 @@ cudaError_t linear_q4_g64_bf16(
     int M, int N, int K,
     cudaStream_t stream);
 
+// Same as above but adds residual[M, N] to output: y = x @ w.T + residual.
+// Eliminates a separate residual_add kernel launch.
+cudaError_t linear_q4_g64_bf16_residual(
+    const uint8_t* __restrict__ w_packed,
+    const __nv_bfloat16* __restrict__ w_scales,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    const __nv_bfloat16* __restrict__ residual,
+    int M, int N, int K,
+    cudaStream_t stream);
+
 }  // namespace ops
 }  // namespace viper
 

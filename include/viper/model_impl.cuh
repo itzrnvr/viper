@@ -204,7 +204,7 @@ public:
             gpu_allocs_.push_back(*d); return true;
         };
         if (!alloc((void**)&x_, H * 2)) return false;
-        if (!alloc((void**)&res_, H * 2)) return false;
+        if (!alloc((void**)&x_norm_, H * 2)) return false;
         if (!alloc((void**)&q_, nQ * 2)) return false;
         if (!alloc((void**)&kb_, nKV * 2)) return false;
         if (!alloc((void**)&vb_, nKV * 2)) return false;
@@ -212,10 +212,12 @@ public:
         if (!alloc((void**)&g_, I * 2)) return false;
         if (!alloc((void**)&u_, I * 2)) return false;
         if (!alloc((void**)&logits_, (size_t)cfg.vocab * 2)) return false;
-        if (!alloc((void**)&cos_t_, HD * 4)) return false;
-        if (!alloc((void**)&sin_t_, HD * 4)) return false;
+        // Pre-compute RoPE cos/sin tables for all positions (eliminates per-token launch).
+        if (!alloc((void**)&cos_t_, (size_t)kv_max_seq * HD * 4)) return false;
+        if (!alloc((void**)&sin_t_, (size_t)kv_max_seq * HD * 4)) return false;
         if (!alloc((void**)&d_sample_, 4)) return false;
         if (!alloc((void**)&d_id_, 4)) return false;
+        VK(ops::rope_precompute_cos_sin(cos_t_, sin_t_, 0, kv_max_seq, cfg.rope_theta, HD, 0));
 
         // KV cache: position-major [n_kv, max_kv_len, hd] to match kernel.
         // Each slot = max_kv_len * n_kv_heads * head_dim * 2 bytes.
@@ -246,24 +248,27 @@ public:
 private:
     bool forward_impl(int32_t token, bool want_logits, int32_t* out_token,
                       int pos, int H, int I, int HD, int nQ, int nKVh) {
-        VK(cudaMemcpy(d_id_, &token, 4, cudaMemcpyHostToDevice));
+        VK(cudaMemcpyAsync(d_id_, &token, 4, cudaMemcpyHostToDevice, 0));
         VK(ops::embedding_gather_bf16_i32(embed_, d_id_, x_, 1, 1, cfg.vocab, H, 0));
 
-        VK(ops::rope_precompute_cos_sin(cos_t_, sin_t_, pos, 1, cfg.rope_theta, HD, 0));
+        // RoPE tables pre-computed at load time — index by current position.
+        const float* cos_pos = cos_t_ + (size_t)pos * HD;
+        const float* sin_pos = sin_t_ + (size_t)pos * HD;
 
         const float attn_scale = 1.0f / std::sqrt((float)HD);
         for (int loop = 0; loop < cfg.n_passes; ++loop) {
             for (int l = 0; l < cfg.n_layers; ++l) {
                 const GpuLayer& lw = layers_[l];
-                // residual = x (device-device copy).
-                VK(cudaMemcpyAsync(res_, x_, H * 2, cudaMemcpyDeviceToDevice, 0));
-                VK(ops::rmsnorm_forward_bf16(x_, lw.input_ln, x_, 1, H, cfg.rms_eps, 0));
-                VK(ops::linear_q4_g64_bf16(lw.q.packed, lw.q.scales, x_, q_, 1, lw.q.out_f, lw.q.in_f, 0));
-                VK(ops::linear_q4_g64_bf16(lw.k.packed, lw.k.scales, x_, kb_, 1, lw.k.out_f, lw.k.in_f, 0));
-                VK(ops::linear_q4_g64_bf16(lw.v.packed, lw.v.scales, x_, vb_, 1, lw.v.out_f, lw.v.in_f, 0));
-                VK(ops::rope_apply_inplace_bf16(q_, kb_, cos_t_, sin_t_, 1, nQ, nKVh, 1, HD, 0));
 
-                // KV append at slot. Position-major: offset = pos * n_kv_heads * HD.
+                // --- Attention sublayer ---
+                // Out-of-place rmsnorm: x_ preserved as residual for o_proj.
+                VK(ops::rmsnorm_forward_bf16(x_, lw.input_ln, x_norm_, 1, H, cfg.rms_eps, 0));
+                VK(ops::linear_q4_g64_bf16(lw.q.packed, lw.q.scales, x_norm_, q_, 1, lw.q.out_f, lw.q.in_f, 0));
+                VK(ops::linear_q4_g64_bf16(lw.k.packed, lw.k.scales, x_norm_, kb_, 1, lw.k.out_f, lw.k.in_f, 0));
+                VK(ops::linear_q4_g64_bf16(lw.v.packed, lw.v.scales, x_norm_, vb_, 1, lw.v.out_f, lw.v.in_f, 0));
+                VK(ops::rope_apply_inplace_bf16(q_, kb_, cos_pos, sin_pos, 1, nQ, nKVh, 1, HD, 0));
+
+                // KV append.
                 const int slot = loop * cfg.n_layers + l;
                 const size_t row_bytes = (size_t)nKVh * HD * 2;
                 VK(cudaMemcpyAsync(kv_k_[slot] + (size_t)pos * nKVh * HD, kb_, row_bytes,
@@ -271,22 +276,25 @@ private:
                 VK(cudaMemcpyAsync(kv_v_[slot] + (size_t)pos * nKVh * HD, vb_, row_bytes,
                                    cudaMemcpyDeviceToDevice, 0));
 
-                // Attention over pos+1 cached positions.
                 VK(ops::attn_decode_bf16(q_, kv_k_[slot], kv_v_[slot], attn_,
                                          nQ, nKVh, HD, pos + 1, attn_scale, 0));
-                VK(ops::linear_q4_g64_bf16(lw.o.packed, lw.o.scales, attn_, x_, 1, lw.o.out_f, lw.o.in_f, 0));
-                VK(ops::residual_add_bf16(res_, x_, x_, H, 0));
+                // Fused o_proj + residual: x_ = o_proj(attn) + x_.
+                VK(ops::linear_q4_g64_bf16_residual(lw.o.packed, lw.o.scales, attn_, x_, x_,
+                                                     1, lw.o.out_f, lw.o.in_f, 0));
 
-                // Save x as new residual, then post-attn layernorm + MLP.
-                VK(cudaMemcpyAsync(res_, x_, H * 2, cudaMemcpyDeviceToDevice, 0));
-                VK(ops::rmsnorm_forward_bf16(x_, lw.post_ln, x_, 1, H, cfg.rms_eps, 0));
-                VK(ops::linear_q4_g64_bf16(lw.gate.packed, lw.gate.scales, x_, g_, 1, lw.gate.out_f, lw.gate.in_f, 0));
-                VK(ops::linear_q4_g64_bf16(lw.up.packed, lw.up.scales, x_, u_, 1, lw.up.out_f, lw.up.in_f, 0));
+                // --- MLP sublayer ---
+                // Out-of-place rmsnorm: x_ preserved as residual for down_proj.
+                VK(ops::rmsnorm_forward_bf16(x_, lw.post_ln, x_norm_, 1, H, cfg.rms_eps, 0));
+                VK(ops::linear_q4_g64_bf16(lw.gate.packed, lw.gate.scales, x_norm_, g_,
+                                           1, lw.gate.out_f, lw.gate.in_f, 0));
+                VK(ops::linear_q4_g64_bf16(lw.up.packed, lw.up.scales, x_norm_, u_,
+                                           1, lw.up.out_f, lw.up.in_f, 0));
                 VK(ops::swiglu_inplace_bf16(g_, u_, I, 0));
-                VK(ops::linear_q4_g64_bf16(lw.down.packed, lw.down.scales, g_, x_, 1, lw.down.out_f, lw.down.in_f, 0));
-                VK(ops::residual_add_bf16(res_, x_, x_, H, 0));
+                // Fused down_proj + residual: x_ = down_proj(swiglu) + x_.
+                VK(ops::linear_q4_g64_bf16_residual(lw.down.packed, lw.down.scales, g_, x_, x_,
+                                                     1, lw.down.out_f, lw.down.in_f, 0));
             }
-            // Inter-pass + final norm (skip_loop_final_norm=false in config).
+            // Inter-pass + final norm (in-place — no residual connection here).
             VK(ops::rmsnorm_forward_bf16(x_, final_norm_, x_, 1, H, cfg.rms_eps, 0));
         }
 
@@ -294,8 +302,8 @@ private:
         if (want_logits) {
             VK(ops::linear_bf16(lm_head_, x_, logits_, 1, cfg.vocab, H, 0));
             VK(ops::sampling_greedy_bf16(logits_, d_sample_, 1, cfg.vocab, 0));
+            VK(cudaMemcpy(out_token, d_sample_, 4, cudaMemcpyDeviceToHost));
         }
-        VK(cudaDeviceSynchronize());
         return true;
     }
 
@@ -304,7 +312,7 @@ private:
     const __nv_bfloat16* embed_ = nullptr;
     const __nv_bfloat16* lm_head_ = nullptr;
     const __nv_bfloat16* final_norm_ = nullptr;
-    __nv_bfloat16 *x_ = nullptr, *res_ = nullptr, *q_ = nullptr, *kb_ = nullptr,
+    __nv_bfloat16 *x_ = nullptr, *x_norm_ = nullptr, *q_ = nullptr, *kb_ = nullptr,
                   *vb_ = nullptr, *attn_ = nullptr, *g_ = nullptr, *u_ = nullptr,
                   *logits_ = nullptr;
     float *cos_t_ = nullptr, *sin_t_ = nullptr;
