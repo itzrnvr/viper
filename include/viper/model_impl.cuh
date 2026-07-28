@@ -68,8 +68,8 @@ struct GpuLayer {
 class NanbeigeEngine {
 public:
     ModelConfig cfg;
-    int kv_max_seq = 2048;  // reduced for batch buffer headroom
-    int max_batch = 5;      // K+1 for K=4 spec decode
+    int kv_max_seq = 4096;
+    int max_batch = 1;  // set to K+1 for spec decode
 
     bool load(const std::string& path) {
         HANDLE hf = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
