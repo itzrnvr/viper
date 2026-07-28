@@ -29,14 +29,16 @@ int main(int argc, char** argv) {
     int max_tokens = std::atoi(arg_val(argc, argv, "--max-tokens", "128").c_str());
 
     viper::Tokenizer tok;
-    if (!tok.load(vocab_p)) return 1;
+    if (!tok.load(vocab_p)) { std::fprintf(stderr, "[cli] tokenizer load failed for %s\n", vocab_p.c_str()); return 1; }
+    std::printf("[cli] tokenizer loaded\n");
     viper::NanbeigeEngine engine;
-    if (!engine.load(model_p)) return 1;
+    if (!engine.load(model_p)) { std::fprintf(stderr, "[cli] engine load failed\n"); return 1; }
 
     // ChatML template (Nanbeige default).
     std::string full = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
     std::vector<int32_t> ids = tok.encode(full);
     std::printf("[cli] prompt tokens: %zu\n", ids.size());
+    std::fflush(stdout);
 
     auto t0 = std::chrono::steady_clock::now();
 

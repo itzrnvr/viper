@@ -68,7 +68,7 @@ struct GpuLayer {
 class NanbeigeEngine {
 public:
     ModelConfig cfg;
-    int kv_max_seq = 8192;   // runtime context cap (VRAM-bound)
+    int kv_max_seq = 4096;   // runtime context cap (VRAM-bound, reduced for 8 GB)
 
     bool load(const std::string& path) {
         HANDLE hf = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
@@ -87,29 +87,50 @@ public:
         map_view_ = (void*)view;
 
         const uint8_t* p = view;
-        if (fsz < 48 || std::memcmp(p, "VIPER", 5) != 0) {
+        if (fsz < 56 || std::memcmp(p, "VIPER", 5) != 0) {
             std::fprintf(stderr, "[viper] bad artifact magic\n"); return false;
         }
-        p += 8;  // skip 8-byte magic (was "VIPER001" in earlier header, now 16-byte magic in include/viper/common.h)
-        // After 8-byte magic we have 10 uint32_t header fields
+        // Artifact format: 16-byte magic "VIPER\0..." + 40-byte header + data.
+        // Header: version(4) + n_layers(4) + n_passes(4) + hidden(4) + intermediate(4)
+        //         + n_heads(4) + n_kv_heads(4) + head_dim(4) + vocab(4) + max_seq(4) + eps(4)
+        p += 16;
+        // The header is 10 uint32 fields: version, n_layers, n_passes, hidden,
+        // intermediate, n_heads, n_kv_heads, head_dim, vocab, max_seq, eps(float).
         uint32_t hdr[10];
         std::memcpy(hdr, p, 40); p += 40;
-        cfg.n_layers = hdr[0]; cfg.n_passes = hdr[1]; cfg.hidden = hdr[2];
-        cfg.intermediate = hdr[3]; cfg.n_heads = hdr[4]; cfg.n_kv_heads = hdr[5];
-        cfg.head_dim = hdr[6]; cfg.vocab = hdr[7]; cfg.max_seq = hdr[8];
-        // hdr[9] is the start of the eps float
+        if (hdr[0] != 1) { std::fprintf(stderr, "[viper] unsupported artifact version %u\n", hdr[0]); return false; }
+        cfg.n_layers = hdr[1]; cfg.n_passes = hdr[2]; cfg.hidden = hdr[3];
+        cfg.intermediate = hdr[4]; cfg.n_heads = hdr[5]; cfg.n_kv_heads = hdr[6];
+        cfg.head_dim = hdr[7]; cfg.vocab = hdr[8]; cfg.max_seq = hdr[9];
+        std::fprintf(stderr, "[viper] debug: version=%u n_layers=%u n_passes=%u hidden=%u vocab=%u\n",
+                    hdr[0], hdr[1], hdr[2], hdr[3], hdr[8]);
+        // The header fields are: hdr[0]=version, hdr[1]=n_layers, hdr[2]=n_passes,
+        // hdr[3]=hidden, hdr[4]=intermediate, hdr[5]=n_heads, hdr[6]=n_kv_heads,
+        // hdr[7]=head_dim, hdr[8]=vocab, hdr[9]=max_seq.
         std::printf("[viper] artifact: %d layers x %d passes, hidden=%d, vocab=%d\n",
                     cfg.n_layers, cfg.n_passes, cfg.hidden, cfg.vocab);
 
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        std::printf("[viper] VRAM free %.2f / %.2f GB\n", free_b/1e9, total_b/1e9);
+        std::printf("[viper] VRAM free %.2f / %.2f GiB\n", free_b/1073741824.0, total_b/1073741824.0);
+        // The model needs ~6.5 GiB; if we have less, we'll run out during upload.
+        if (free_b < (size_t)6.5 * 1024 * 1024 * 1024) {
+            std::fprintf(stderr, "[viper] insufficient VRAM headroom (%.2f GiB free, need ~6.5 GiB)\n", free_b/1073741824.0);
+            return false;
+        }
 
+        // The artifact has per-PASS tensors. Upload pass 0 as the live weights.
+        // For pass 1 we read the same physical weights (the artifact writes pass 1
+        // identical to pass 0 since the model is weight-tied) but we don't upload
+        // them twice — we point pass 1 layers at the pass 0 buffers.
         layers_.resize(cfg.n_layers);
         auto upload = [&](const uint8_t*& p, size_t& remain, void** dst) -> bool {
             if (remain < 8) return false;
             uint64_t sz; std::memcpy(&sz, p, 8); p += 8; remain -= 8;
-            if (remain < sz) return false;
+            if (remain < sz) {
+                std::fprintf(stderr, "[viper] upload fail: need %zu have %zu remain\n", (size_t)sz, remain);
+                return false;
+            }
             void* d = nullptr;
             if (cudaMalloc(&d, sz) != cudaSuccess) return false;
             if (cudaMemcpy(d, p, sz, cudaMemcpyHostToDevice) != cudaSuccess) return false;
@@ -125,21 +146,55 @@ public:
         const int lin_in[7]  = {cfg.hidden, cfg.hidden, cfg.hidden,
                                 cfg.n_heads*cfg.head_dim,
                                 cfg.hidden, cfg.hidden, cfg.intermediate};
-        for (int l = 0; l < cfg.n_layers; ++l) {
-            GpuLayer& gl = layers_[l];
-            GpuLinearQ4* lins[7] = {&gl.q, &gl.k, &gl.v, &gl.o, &gl.gate, &gl.up, &gl.down};
-            for (int i = 0; i < 7; ++i) {
-                if (!upload(p, remain, (void**)&lins[i]->packed)) return false;
-                if (!upload(p, remain, (void**)&lins[i]->scales)) return false;
-                lins[i]->out_f = lin_out[i]; lins[i]->in_f = lin_in[i];
+
+        // The converter writes exactly this order:
+        //   Pass 0: layer 0 linears, layer 1 linears, ..., layer 21 linears (7 each)
+        //   Pass 1: layer 0 linears, layer 1 linears, ..., layer 21 linears (7 each)
+        //   embed, lm_head, final_norm (BF16)
+        //   Pass 0: layer 0 norms, layer 1 norms, ..., layer 21 norms (2 each)
+        //   Pass 1: layer 0 norms, layer 1 norms, ..., layer 21 norms (2 each)
+        for (int pass = 0; pass < cfg.n_passes; ++pass) {
+            for (int l = 0; l < cfg.n_layers; ++l) {
+                GpuLayer& gl = layers_[l];
+                GpuLinearQ4* lins[7] = {&gl.q, &gl.k, &gl.v, &gl.o, &gl.gate, &gl.up, &gl.down};
+                if (pass == 0) {
+                    for (int i = 0; i < 7; ++i) {
+                        if (!upload(p, remain, (void**)&lins[i]->packed)) return false;
+                        if (!upload(p, remain, (void**)&lins[i]->scales)) return false;
+                        lins[i]->out_f = lin_out[i]; lins[i]->in_f = lin_in[i];
+                    }
+                } else {
+                    // Pass 1: skip 7 linears (shared with pass 0).
+                    for (int i = 0; i < 7; ++i) {
+                        uint64_t sz; std::memcpy(&sz, p, 8); p += 8; remain -= 8; p += sz; remain -= sz;
+                        std::memcpy(&sz, p, 8); p += 8; remain -= 8; p += sz; remain -= sz;
+                    }
+                    for (int i = 0; i < 7; ++i) {
+                        lins[i]->packed = layers_[l].q.packed;
+                        lins[i]->scales = layers_[l].q.scales;
+                        lins[i]->out_f = lin_out[i]; lins[i]->in_f = lin_in[i];
+                    }
+                }
             }
-            if (!upload(p, remain, (void**)&gl.input_ln)) return false;
-            if (!upload(p, remain, (void**)&gl.post_ln)) return false;
         }
+        // Then embed, lm_head, final_norm (BF16).
         if (!upload(p, remain, (void**)&embed_)) return false;
         if (!upload(p, remain, (void**)&lm_head_)) return false;
         if (!upload(p, remain, (void**)&final_norm_)) return false;
-        std::printf("[viper] weights uploaded\n");
+        // Then all 44 layers' norms (2 per layer, shared across passes).
+        for (int pass = 0; pass < cfg.n_passes; ++pass) {
+            for (int l = 0; l < cfg.n_layers; ++l) {
+                if (pass == 0) {
+                    if (!upload(p, remain, (void**)&layers_[l].input_ln)) return false;
+                    if (!upload(p, remain, (void**)&layers_[l].post_ln)) return false;
+                } else {
+                    uint64_t sz; std::memcpy(&sz, p, 8); p += 8; remain -= 8; p += sz; remain -= sz;
+                    std::memcpy(&sz, p, 8); p += 8; remain -= 8; p += sz; remain -= sz;
+                }
+            }
+        }
+        std::printf("[viper] weights uploaded (layers=%zu, gpu_allocs=%zu)\n",
+                    layers_.size(), gpu_allocs_.size());
 
         // Activations.
         const int H = cfg.hidden, I = cfg.intermediate, HD = cfg.head_dim;
