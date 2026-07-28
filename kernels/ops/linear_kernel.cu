@@ -40,15 +40,9 @@ __global__ void linear_q4_g64_warp_kernel(
     // --- Cache x in shared memory ---
     extern __shared__ __nv_bfloat16 smem_x[];
     const __nv_bfloat16* x_row_global = x + (size_t)m * K;
-
-    // Cooperative load: 256 threads load K bf16 values.
-    for (int i = threadIdx.x; i < K; i += blockDim.x) {
-        smem_x[i] = x_row_global[i];
-    }
+    for (int i = threadIdx.x; i < K; i += blockDim.x) { smem_x[i] = x_row_global[i]; }
     __syncthreads();
-
     if (n >= N || m >= M) return;
-    // Now read x from SMEM (fast) instead of HBM.
     const __nv_bfloat16* x_row = smem_x;
 
     const uint8_t* w_row = w_packed + (size_t)n * (K / 2);

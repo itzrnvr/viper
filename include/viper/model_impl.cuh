@@ -68,7 +68,8 @@ struct GpuLayer {
 class NanbeigeEngine {
 public:
     ModelConfig cfg;
-    int kv_max_seq = 4096;   // runtime context cap (VRAM-bound, reduced for 8 GB)
+    int kv_max_seq = 4096;
+    int max_batch = 1;  // set to K+1 for spec decode (increases VRAM usage)
 
     bool load(const std::string& path) {
         HANDLE hf = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
@@ -119,40 +120,32 @@ public:
             return false;
         }
 
-        // The artifact has per-PASS tensors. Upload pass 0 as the live weights.
-        // For pass 1 we read the same physical weights (the artifact writes pass 1
-        // identical to pass 0 since the model is weight-tied) but we don't upload
-        // them twice — we point pass 1 layers at the pass 0 buffers.
+        // Artifact format (C++ converter):
+        //   Pass 0: 22 layers × 7 linears (packed+scales each)
+        //   Pass 1: 22 layers × 7 linears (DUPLICATE — same weights)
+        //   embed, lm_head, final_norm (BF16)
+        //   Pass 0: 22 layers × 2 norms (BF16)
+        //   Pass 1: 22 layers × 2 norms (DUPLICATE)
         layers_.resize(cfg.n_layers);
         auto upload = [&](const uint8_t*& p, size_t& remain, void** dst) -> bool {
             if (remain < 8) return false;
             uint64_t sz; std::memcpy(&sz, p, 8); p += 8; remain -= 8;
-            if (remain < sz) {
-                std::fprintf(stderr, "[viper] upload fail: need %zu have %zu remain\n", (size_t)sz, remain);
-                return false;
-            }
+            if (remain < sz) return false;
             void* d = nullptr;
             if (cudaMalloc(&d, sz) != cudaSuccess) return false;
             if (cudaMemcpy(d, p, sz, cudaMemcpyHostToDevice) != cudaSuccess) return false;
             p += sz; remain -= sz;
-            *dst = d;
-            gpu_allocs_.push_back(d);
+            *dst = d; gpu_allocs_.push_back(d);
             return true;
         };
         size_t remain = fsz - (p - view);
-        const int lin_out[7] = {cfg.n_heads*cfg.head_dim, cfg.n_kv_heads*cfg.head_dim,
+        const int linOut[7] = {cfg.n_heads*cfg.head_dim, cfg.n_kv_heads*cfg.head_dim,
                                 cfg.n_kv_heads*cfg.head_dim, cfg.hidden,
                                 cfg.intermediate, cfg.intermediate, cfg.hidden};
-        const int lin_in[7]  = {cfg.hidden, cfg.hidden, cfg.hidden,
+        const int linIn[7]  = {cfg.hidden, cfg.hidden, cfg.hidden,
                                 cfg.n_heads*cfg.head_dim,
                                 cfg.hidden, cfg.hidden, cfg.intermediate};
 
-        // The converter writes exactly this order:
-        //   Pass 0: layer 0 linears, layer 1 linears, ..., layer 21 linears (7 each)
-        //   Pass 1: layer 0 linears, layer 1 linears, ..., layer 21 linears (7 each)
-        //   embed, lm_head, final_norm (BF16)
-        //   Pass 0: layer 0 norms, layer 1 norms, ..., layer 21 norms (2 each)
-        //   Pass 1: layer 0 norms, layer 1 norms, ..., layer 21 norms (2 each)
         for (int pass = 0; pass < cfg.n_passes; ++pass) {
             for (int l = 0; l < cfg.n_layers; ++l) {
                 GpuLayer& gl = layers_[l];
@@ -161,27 +154,22 @@ public:
                     for (int i = 0; i < 7; ++i) {
                         if (!upload(p, remain, (void**)&lins[i]->packed)) return false;
                         if (!upload(p, remain, (void**)&lins[i]->scales)) return false;
-                        lins[i]->out_f = lin_out[i]; lins[i]->in_f = lin_in[i];
+                        lins[i]->out_f = linOut[i]; lins[i]->in_f = linIn[i];
                     }
                 } else {
-                    // Pass 1: skip 7 linears (shared with pass 0).
+                    // Pass 1: skip duplicate data. Pointers stay from pass 0.
                     for (int i = 0; i < 7; ++i) {
                         uint64_t sz; std::memcpy(&sz, p, 8); p += 8; remain -= 8; p += sz; remain -= sz;
                         std::memcpy(&sz, p, 8); p += 8; remain -= 8; p += sz; remain -= sz;
                     }
-                    for (int i = 0; i < 7; ++i) {
-                        lins[i]->packed = layers_[l].q.packed;
-                        lins[i]->scales = layers_[l].q.scales;
-                        lins[i]->out_f = lin_out[i]; lins[i]->in_f = lin_in[i];
-                    }
                 }
             }
         }
-        // Then embed, lm_head, final_norm (BF16).
+        // embed, lm_head, final_norm.
         if (!upload(p, remain, (void**)&embed_)) return false;
         if (!upload(p, remain, (void**)&lm_head_)) return false;
         if (!upload(p, remain, (void**)&final_norm_)) return false;
-        // Then all 44 layers' norms (2 per layer, shared across passes).
+        // Norms (2 passes, pass 1 is duplicate).
         for (int pass = 0; pass < cfg.n_passes; ++pass) {
             for (int l = 0; l < cfg.n_layers; ++l) {
                 if (pass == 0) {
@@ -196,28 +184,29 @@ public:
         std::printf("[viper] weights uploaded (layers=%zu, gpu_allocs=%zu)\n",
                     layers_.size(), gpu_allocs_.size());
 
-        // Activations.
         const int H = cfg.hidden, I = cfg.intermediate, HD = cfg.head_dim;
         const int nQ = cfg.n_heads * HD, nKV = cfg.n_kv_heads * HD;
+        const int MB = max_batch;  // batch dimension for allocation
         auto alloc = [&](void** d, size_t sz) -> bool {
             if (cudaMalloc(d, sz) != cudaSuccess) return false;
             gpu_allocs_.push_back(*d); return true;
         };
-        if (!alloc((void**)&x_, H * 2)) return false;
-        if (!alloc((void**)&x_norm_, H * 2)) return false;
-        if (!alloc((void**)&q_, nQ * 2)) return false;
-        if (!alloc((void**)&kb_, nKV * 2)) return false;
-        if (!alloc((void**)&vb_, nKV * 2)) return false;
-        if (!alloc((void**)&attn_, nQ * 2)) return false;
-        if (!alloc((void**)&g_, I * 2)) return false;
-        if (!alloc((void**)&u_, I * 2)) return false;
-        if (!alloc((void**)&logits_, (size_t)cfg.vocab * 2)) return false;
-        // Pre-compute RoPE cos/sin tables for all positions (eliminates per-token launch).
+        if (!alloc((void**)&x_, (size_t)MB * H * 2)) return false;
+        if (!alloc((void**)&x_norm_, (size_t)MB * H * 2)) return false;
+        if (!alloc((void**)&q_, (size_t)MB * nQ * 2)) return false;
+        if (!alloc((void**)&kb_, (size_t)MB * nKV * 2)) return false;
+        if (!alloc((void**)&vb_, (size_t)MB * nKV * 2)) return false;
+        if (!alloc((void**)&attn_, (size_t)MB * nQ * 2)) return false;
+        if (!alloc((void**)&g_, (size_t)MB * I * 2)) return false;
+        if (!alloc((void**)&u_, (size_t)MB * I * 2)) return false;
+        if (!alloc((void**)&logits_, (size_t)MB * cfg.vocab * 2)) return false;
+        // Pre-compute RoPE cos/sin tables for all positions.
         if (!alloc((void**)&cos_t_, (size_t)kv_max_seq * HD * 4)) return false;
         if (!alloc((void**)&sin_t_, (size_t)kv_max_seq * HD * 4)) return false;
-        if (!alloc((void**)&d_sample_, 4)) return false;
-        if (!alloc((void**)&d_id_, 4)) return false;
+        if (!alloc((void**)&d_sample_, (size_t)MB * 4)) return false;
+        if (!alloc((void**)&d_id_, (size_t)MB * 4)) return false;
         VK(ops::rope_precompute_cos_sin(cos_t_, sin_t_, 0, kv_max_seq, cfg.rope_theta, HD, 0));
+        VK(cudaDeviceSynchronize());  // DEBUG: check rope precompute
 
         // KV cache: position-major [n_kv, max_kv_len, hd] to match kernel.
         // Each slot = max_kv_len * n_kv_heads * head_dim * 2 bytes.
@@ -236,6 +225,7 @@ public:
 
     void reset() { seq_len_ = 0; }
     int seq_len() const { return seq_len_; }
+    void rollback(int n) { seq_len_ -= n; }  // undo rejected draft tokens
 
     bool forward(int32_t token, bool want_logits, int32_t* out_token) {
         const int H = cfg.hidden, I = cfg.intermediate, HD = cfg.head_dim;
@@ -245,11 +235,75 @@ public:
         return forward_impl(token, want_logits, out_token, pos, H, I, HD, nQ, nKVh);
     }
 
+    // Batch forward: process M tokens in a single pass (for spec decode).
+    // Weights are read ONCE and reused across all M tokens.
+    bool forward_batch(const int32_t* tokens, int M, int32_t* out_tokens) {
+        if (M <= 0 || M > max_batch) return false;
+        const int H = cfg.hidden, I = cfg.intermediate, HD = cfg.head_dim;
+        const int nQ = cfg.n_heads, nKVh = cfg.n_kv_heads;
+        const int pos = seq_len_;
+        if (pos + M > kv_max_seq) return false;
+
+        // Copy M token IDs to device.
+        VK(cudaMemcpyAsync(d_id_, tokens, M * 4, cudaMemcpyHostToDevice, 0));
+        VK(ops::embedding_gather_bf16_i32(embed_, d_id_, x_, 1, M, cfg.vocab, H, 0));
+
+        const float* cos_pos = cos_t_ + (size_t)pos * HD;
+        const float* sin_pos = sin_t_ + (size_t)pos * HD;
+        const float attn_scale = 1.0f / std::sqrt((float)HD);
+
+        for (int loop = 0; loop < cfg.n_passes; ++loop) {
+            for (int l = 0; l < cfg.n_layers; ++l) {
+                const GpuLayer& lw = layers_[l];
+                const int nQD = nQ * HD, nKVD = nKVh * HD;
+
+                // --- Attention sublayer (batch) ---
+                VK(ops::rmsnorm_forward_bf16(x_, lw.input_ln, x_norm_, M, H, cfg.rms_eps, 0));
+                VK(ops::linear_q4_g64_bf16(lw.q.packed, lw.q.scales, x_norm_, q_,
+                                           M, lw.q.out_f, lw.q.in_f, 0));
+                VK(ops::linear_q4_g64_bf16(lw.k.packed, lw.k.scales, x_norm_, kb_,
+                                           M, lw.k.out_f, lw.k.in_f, 0));
+                VK(ops::linear_q4_g64_bf16(lw.v.packed, lw.v.scales, x_norm_, vb_,
+                                           M, lw.v.out_f, lw.v.in_f, 0));
+                VK(ops::rope_apply_inplace_bf16(q_, kb_, cos_pos, sin_pos,
+                                                 1, nQ, nKVh, M, HD, 0));
+
+                // Batch KV append + batch attention with causal masking.
+                const int slot = loop * cfg.n_layers + l;
+                VK(ops::kv_append_batch_bf16(kb_, vb_, kv_k_[slot], kv_v_[slot],
+                                             M, nKVh, HD, pos, 0));
+                VK(ops::attn_batch_bf16(q_, kv_k_[slot], kv_v_[slot], attn_,
+                                         M, nQ, nKVh, HD, pos, attn_scale, 0));
+                // Fused o_proj + residual.
+                VK(ops::linear_q4_g64_bf16_residual(lw.o.packed, lw.o.scales, attn_, x_, x_,
+                                                     M, lw.o.out_f, lw.o.in_f, 0));
+
+                // --- MLP sublayer (batch) ---
+                VK(ops::rmsnorm_forward_bf16(x_, lw.post_ln, x_norm_, M, H, cfg.rms_eps, 0));
+                VK(ops::linear_q4_g64_bf16(lw.gate.packed, lw.gate.scales, x_norm_, g_,
+                                           M, lw.gate.out_f, lw.gate.in_f, 0));
+                VK(ops::linear_q4_g64_bf16(lw.up.packed, lw.up.scales, x_norm_, u_,
+                                           M, lw.up.out_f, lw.up.in_f, 0));
+                VK(ops::swiglu_inplace_bf16(g_, u_, M * I, 0));
+                VK(ops::linear_q4_g64_bf16_residual(lw.down.packed, lw.down.scales, g_, x_, x_,
+                                                     M, lw.down.out_f, lw.down.in_f, 0));
+            }
+            VK(ops::rmsnorm_forward_bf16(x_, final_norm_, x_, M, H, cfg.rms_eps, 0));
+        }
+
+        seq_len_ += M;
+        VK(ops::linear_bf16(lm_head_, x_, logits_, M, cfg.vocab, H, 0));
+        VK(ops::sampling_greedy_bf16(logits_, d_sample_, M, cfg.vocab, 0));
+        VK(cudaMemcpy(out_tokens, d_sample_, M * 4, cudaMemcpyDeviceToHost));
+        return true;
+    }
+
 private:
     bool forward_impl(int32_t token, bool want_logits, int32_t* out_token,
                       int pos, int H, int I, int HD, int nQ, int nKVh) {
         VK(cudaMemcpyAsync(d_id_, &token, 4, cudaMemcpyHostToDevice, 0));
         VK(ops::embedding_gather_bf16_i32(embed_, d_id_, x_, 1, 1, cfg.vocab, H, 0));
+
 
         // RoPE tables pre-computed at load time — index by current position.
         const float* cos_pos = cos_t_ + (size_t)pos * HD;

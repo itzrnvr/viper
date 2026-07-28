@@ -21,4 +21,30 @@ cudaError_t attn_decode_bf16(
     float scale,
     cudaStream_t stream);
 
+// Batch attention with causal masking (for speculative decode verification).
+// Grid: (nQ, M). Token m attends to positions 0..pos_start+m.
+//   q: [M, nQ, D]
+//   k_cache/v_cache: [T_total, nKV, D] — must already contain entries for pos_start..pos_start+M-1
+//   out: [M, nQ, D]
+cudaError_t attn_batch_bf16(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    __nv_bfloat16* __restrict__ out,
+    int M, int nQ, int nKV, int D,
+    int pos_start,
+    float scale,
+    cudaStream_t stream);
+
+// Batch KV cache append: copies M K/V vectors into the cache.
+//   new_k/new_v: [M, nKV, D]
+//   k_cache/v_cache: [T_total, nKV, D]
+cudaError_t kv_append_batch_bf16(
+    const __nv_bfloat16* new_k,
+    const __nv_bfloat16* new_v,
+    __nv_bfloat16* k_cache,
+    __nv_bfloat16* v_cache,
+    int M, int nKV, int D, int pos_start,
+    cudaStream_t stream);
+
 } }  // namespace viper::ops
