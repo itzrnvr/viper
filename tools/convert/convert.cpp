@@ -208,6 +208,7 @@ int main(int argc, char** argv) {
     const int n_heads = 48;
     const int n_kv_heads = 8;
     const int D = 128;
+    const int V = 166144;
 
     // Quantize the linears.
     auto write_linear = [&](const std::string& key, int rows, int cols) {
@@ -265,7 +266,7 @@ int main(int argc, char** argv) {
     }
 
     if (!write_bf16("model.embed_tokens.weight")) return 1;
-    if (!write_bf16("lm_head.weight")) return 1;
+    if (!write_linear("lm_head.weight", V, H)) return 1;  // Q4_G64: saves 0.76 GB/token
     if (!write_bf16("model.norm.weight")) return 1;
     for (int p = 0; p < n_passes; ++p) {
         for (int l = 0; l < n_layers; ++l) {

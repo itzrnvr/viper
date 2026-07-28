@@ -167,7 +167,9 @@ public:
         }
         // embed, lm_head, final_norm.
         if (!upload(p, remain, (void**)&embed_)) return false;
-        if (!upload(p, remain, (void**)&lm_head_)) return false;
+        if (!upload(p, remain, (void**)&lm_head_q4_.packed)) return false;
+        if (!upload(p, remain, (void**)&lm_head_q4_.scales)) return false;
+        lm_head_q4_.out_f = cfg.vocab; lm_head_q4_.in_f = cfg.hidden;
         if (!upload(p, remain, (void**)&final_norm_)) return false;
         // Norms (2 passes, pass 1 is duplicate).
         for (int pass = 0; pass < cfg.n_passes; ++pass) {
@@ -292,7 +294,7 @@ public:
         }
 
         seq_len_ += M;
-        VK(ops::linear_bf16(lm_head_, x_, logits_, M, cfg.vocab, H, 0));
+        VK(ops::linear_q4_g64_bf16(lm_head_q4_.packed, lm_head_q4_.scales, x_, logits_, M, cfg.vocab, H, 0));
         VK(ops::sampling_greedy_bf16(logits_, d_sample_, M, cfg.vocab, 0));
         VK(cudaMemcpy(out_tokens, d_sample_, M * 4, cudaMemcpyDeviceToHost));
         return true;
@@ -354,7 +356,7 @@ private:
 
         ++seq_len_;
         if (want_logits) {
-            VK(ops::linear_bf16(lm_head_, x_, logits_, 1, cfg.vocab, H, 0));
+            VK(ops::linear_q4_g64_bf16(lm_head_q4_.packed, lm_head_q4_.scales, x_, logits_, 1, cfg.vocab, H, 0));
             VK(ops::sampling_greedy_bf16(logits_, d_sample_, 1, cfg.vocab, 0));
             VK(cudaMemcpy(out_token, d_sample_, 4, cudaMemcpyDeviceToHost));
         }
@@ -364,7 +366,7 @@ private:
     ModelConfig cfg_;
     std::vector<GpuLayer> layers_;
     const __nv_bfloat16* embed_ = nullptr;
-    const __nv_bfloat16* lm_head_ = nullptr;
+    GpuLinearQ4 lm_head_q4_;
     const __nv_bfloat16* final_norm_ = nullptr;
     __nv_bfloat16 *x_ = nullptr, *x_norm_ = nullptr, *q_ = nullptr, *kb_ = nullptr,
                   *vb_ = nullptr, *attn_ = nullptr, *g_ = nullptr, *u_ = nullptr,
