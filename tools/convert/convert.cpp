@@ -93,23 +93,25 @@ static void quantize_q4_g64(const uint16_t* w, int N, int K,
                            std::vector<uint16_t>& scales_bf16) {
     packed.assign(N * K / 2, 0);
     scales_bf16.assign(N * K / 64, 0);
+    // CRITICAL: proper BF16→float32 conversion (shift to upper 16 bits).
+    auto bf16_to_f32 = [](uint16_t bits) -> float {
+        uint32_t u = (uint32_t)bits << 16;
+        float v; std::memcpy(&v, &u, 4);
+        return v;
+    };
     for (int n = 0; n < N; ++n) {
         for (int g = 0; g < K / 64; ++g) {
             float max_abs = 0.0f;
             for (int j = 0; j < 64; ++j) {
-                uint16_t bits = w[n * K + g * 64 + j];
-                float v; std::memcpy(&v, &bits, 4);
-                v = std::fmax(v, -v);
+                float v = std::fabs(bf16_to_f32(w[n * K + g * 64 + j]));
                 if (v > max_abs) max_abs = v;
             }
             float scale = max_abs / 7.0f;
             if (scale < 1e-8f) scale = 1e-8f;
-            float sf; std::memcpy(&sf, &scale, 4);
-            uint16_t sfb = (uint16_t)(*reinterpret_cast<uint32_t*>(&sf) >> 16);
-            scales_bf16[n * (K / 64) + g] = sfb;
+            uint32_t su; std::memcpy(&su, &scale, 4);
+            scales_bf16[n * (K / 64) + g] = (uint16_t)(su >> 16);
             for (int j = 0; j < 64; ++j) {
-                uint16_t bits = w[n * K + g * 64 + j];
-                float v; std::memcpy(&v, &bits, 4);
+                float v = bf16_to_f32(w[n * K + g * 64 + j]);
                 int stored = (int)std::round(v / scale) + 8;
                 if (stored < 0) stored = 0;
                 if (stored > 15) stored = 15;
