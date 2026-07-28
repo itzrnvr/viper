@@ -15,6 +15,9 @@ if not exist "%PROJECT%\build" mkdir "%PROJECT%\build"
     "%PROJECT%\kernels\ops\embedding_kernel.cu" ^
     "%PROJECT%\kernels\ops\swiglu_kernel.cu" ^
     "%PROJECT%\kernels\ops\residual_kernel.cu" ^
+    "%PROJECT%\kernels\ops\linear_kernel.cu" ^
+    "%PROJECT%\kernels\ops\sdpa_kernel.cu" ^
+    "%PROJECT%\kernels\ops\sampling_kernel.cu" ^
     -o "%PROJECT%\build\engine_smoke.exe"
 if errorlevel 1 ( echo nvcc FAILED & exit /b 1 )
 "%PROJECT%\build\engine_smoke.exe"
