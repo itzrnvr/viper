@@ -122,36 +122,36 @@ bool read_safetensors(const std::string& path,
 
 // Quantize BF16 weight to Q4_G64 (symmetric, group size 64).
 // Returns packed bytes (N*K/2) and scales (N*K/64).
+// CRITICAL FIX: proper BF16→float32 conversion (shift to upper 16 bits).
 void quantize_q4_g64(const uint16_t* bf16_weights, int N, int K,
                     std::vector<uint8_t>& packed,
                     std::vector<uint16_t>& scales_bf16) {
     packed.assign(N * K / 2, 0);
     scales_bf16.assign(N * K / 64, 0);
+    auto bf16_to_f32 = [](uint16_t bits) -> float {
+        uint32_t bits32 = (uint32_t)bits << 16;  // BF16 → upper 16 bits of float32
+        float v;
+        std::memcpy(&v, &bits32, 4);
+        return v;
+    };
     for (int n = 0; n < N; ++n) {
         for (int g = 0; g < K / 64; ++g) {
-            // Find max abs in this group.
             float max_abs = 0.0f;
             for (int j = 0; j < 64; ++j) {
-                uint16_t bits = bf16_weights[n * K + g * 64 + j];
-                float v;
-                std::memcpy(&v, &bits, 4);
-                v = std::fmax(v, -v);
+                float v = bf16_to_f32(bf16_weights[n * K + g * 64 + j]);
+                v = std::fabs(v);
                 if (v > max_abs) max_abs = v;
             }
             float scale = max_abs / 7.0f;
             if (scale < 1e-8f) scale = 1e-8f;
-            // Convert scale to BF16.
-            uint16_t scale_bits;
-            float scale_clamped = scale;
-            std::memcpy(&scale_bits, &scale_clamped, 4);
-            // The BF16 is the upper 16 bits of FP32.
-            uint16_t bf16 = scale_bits >> 16;
-            scales_bf16[n * (K / 64) + g] = bf16;
+            // Convert scale to BF16 (upper 16 bits of float32).
+            uint32_t scale_bits32;
+            std::memcpy(&scale_bits32, &scale, 4);
+            uint16_t bf16_scale = (uint16_t)(scale_bits32 >> 16);
+            scales_bf16[n * (K / 64) + g] = bf16_scale;
             // Pack the 64 weights.
             for (int j = 0; j < 64; ++j) {
-                uint16_t bits = bf16_weights[n * K + g * 64 + j];
-                float v;
-                std::memcpy(&v, &bits, 4);
+                float v = bf16_to_f32(bf16_weights[n * K + g * 64 + j]);
                 int stored = (int)std::round(v / scale) + 8;
                 if (stored < 0) stored = 0;
                 if (stored > 15) stored = 15;
