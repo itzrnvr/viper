@@ -213,8 +213,9 @@ public:
         if (!alloc((void**)&u_, I * 2)) return false;
         if (!alloc((void**)&logits_, (size_t)cfg.vocab * 2)) return false;
         if (!alloc((void**)&cos_t_, HD * 4)) return false;
-        if (!alloc((void**)&d_sample_, 4)) return false;
         if (!alloc((void**)&sin_t_, HD * 4)) return false;
+        if (!alloc((void**)&d_sample_, 4)) return false;
+        if (!alloc((void**)&d_id_, 4)) return false;
 
         // KV cache: position-major [n_kv, max_kv_len, hd] to match kernel.
         // Each slot = max_kv_len * n_kv_heads * head_dim * 2 bytes.
@@ -245,11 +246,8 @@ public:
 private:
     bool forward_impl(int32_t token, bool want_logits, int32_t* out_token,
                       int pos, int H, int I, int HD, int nQ, int nKVh) {
-        int32_t* d_id = nullptr;
-        VK(cudaMalloc(&d_id, 4));
-        VK(cudaMemcpy(d_id, &token, 4, cudaMemcpyHostToDevice));
-        VK(ops::embedding_gather_bf16_i32(embed_, d_id, x_, 1, 1, cfg.vocab, H, 0));
-        cudaFree(d_id);
+        VK(cudaMemcpy(d_id_, &token, 4, cudaMemcpyHostToDevice));
+        VK(ops::embedding_gather_bf16_i32(embed_, d_id_, x_, 1, 1, cfg.vocab, H, 0));
 
         VK(ops::rope_precompute_cos_sin(cos_t_, sin_t_, pos, 1, cfg.rope_theta, HD, 0));
 
@@ -296,7 +294,6 @@ private:
         if (want_logits) {
             VK(ops::linear_bf16(lm_head_, x_, logits_, 1, cfg.vocab, H, 0));
             VK(ops::sampling_greedy_bf16(logits_, d_sample_, 1, cfg.vocab, 0));
-            VK(cudaMemcpy(out_token, d_sample_, 4, cudaMemcpyDeviceToHost));
         }
         VK(cudaDeviceSynchronize());
         return true;
@@ -312,6 +309,7 @@ private:
                   *logits_ = nullptr;
     float *cos_t_ = nullptr, *sin_t_ = nullptr;
     int32_t* d_sample_ = nullptr;
+    int32_t* d_id_ = nullptr;
     int kv_slots_ = 0;
     std::vector<__nv_bfloat16*> kv_k_, kv_v_;
     std::vector<void*> gpu_allocs_;

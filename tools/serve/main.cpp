@@ -1,62 +1,46 @@
-// viper_serve — HTTP server with viper chat UI + OpenAI-compatible streaming.
+// viper_serve — HTTP server with the REAL engine integrated.
+// Loads .viper at startup, streams real tokens via SSE.
 //
-// Listens on 127.0.0.1:8080. Endpoints:
-//   GET  /                            -> viper chat UI (chat.html)
-//   GET  /v1/models                   -> JSON model list
-//   POST /v1/chat/completions         -> OpenAI-format SSE streaming
-//   GET  /health                      -> {"status":"ok"}
-//
-// For v1, the server shells out to viper_cli per generation step.
-// This is the simplest correct integration; a shared in-process
-// model instance is a v1.1 optimization.
+// Build: tools\serve\build_serve_cuda.bat
+// Run:   viper_serve.exe --model artifacts\Nanbeige4.2-3B.viper --vocab artifacts\vocab.bin
 
+#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 #include <thread>
-#include <atomic>
-#include <mutex>
 #include <chrono>
+
 #include <winsock2.h>
 #include <ws2tcpip.h>
-
 #pragma comment(lib, "ws2_32.lib")
 
-static std::string read_file(const std::string& path) {
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) return "";
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    std::string s(n, '\0');
-    fread(s.data(), 1, n, f);
-    fclose(f);
-    return s;
-}
+#include "viper/model_impl.cuh"
+#include "viper/tokenizer.h"
+
+static viper::NanbeigeEngine* g_engine = nullptr;
+static viper::Tokenizer* g_tok = nullptr;
 
 static std::string read_request(SOCKET s) {
     std::string req;
     char buf[4096];
-    int header_end = -1;
     while (true) {
         int n = recv(s, buf, sizeof(buf), 0);
         if (n <= 0) break;
         req.append(buf, n);
-        size_t p = req.find("\r\n\r\n");
-        if (p != std::string::npos) {
+        if (req.find("\r\n\r\n") != std::string::npos) {
             size_t cl_pos = req.find("Content-Length:");
             if (cl_pos != std::string::npos) {
                 int cl = std::atoi(req.c_str() + cl_pos + 15);
-                if ((int)req.size() >= (int)p + 4 + cl) {
-                    header_end = (int)(p + 4 + cl);
-                    break;
+                size_t body_start = req.find("\r\n\r\n") + 4;
+                while ((int)req.size() < (int)body_start + cl) {
+                    n = recv(s, buf, sizeof(buf), 0);
+                    if (n <= 0) break;
+                    req.append(buf, n);
                 }
-            } else {
-                header_end = (int)(p + 4);
-                break;
             }
+            break;
         }
     }
     return req;
@@ -68,174 +52,150 @@ static void write_all(SOCKET s, const std::string& data) {
     while (left > 0) {
         int n = send(s, p, left, 0);
         if (n <= 0) break;
-        p += n;
-        left -= n;
+        p += n; left -= n;
     }
 }
 
 static void send_response(SOCKET s, int status, const std::string& body,
-                          const std::string& content_type = "application/json") {
+                          const char* ct = "application/json") {
     const char* st = (status == 200) ? "OK" : (status == 404) ? "Not Found" : "Error";
-    char headers[512];
-    snprintf(headers, sizeof(headers),
-             "HTTP/1.1 %d %s\r\n"
-             "Content-Type: %s\r\n"
-             "Content-Length: %zu\r\n"
-             "Access-Control-Allow-Origin: *\r\n"
-             "Connection: close\r\n"
-             "\r\n",
-             status, st, content_type.c_str(), body.size());
-    write_all(s, std::string(headers) + body);
+    char h[512];
+    snprintf(h, sizeof(h), "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+             "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+             status, st, ct, body.size());
+    write_all(s, std::string(h) + body);
 }
 
-static const std::string CHAT_HTML = "tools/serve/ui/chat.html";
-
-static std::string json_string(const std::string& json, const std::string& key) {
-    std::string needle = "\"" + key + "\"";
-    size_t pos = json.find(needle);
-    if (pos == std::string::npos) return "";
-    pos = json.find(':', pos + needle.size());
-    if (pos == std::string::npos) return "";
-    pos = json.find('"', pos);
-    if (pos == std::string::npos) return "";
-    size_t end = json.find('"', pos + 1);
-    if (end == std::string::npos) return "";
-    return json.substr(pos + 1, end - pos - 1);
+static std::string read_file(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return "";
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    std::string s(n, '\0'); fread(s.data(), 1, n, f); fclose(f);
+    return s;
 }
 
-static int json_int(const std::string& json, const std::string& key, int dflt) {
-    std::string needle = "\"" + key + "\"";
-    size_t pos = json.find(needle);
+static std::string json_string(const std::string& j, const std::string& key) {
+    std::string n = "\"" + key + "\"";
+    size_t pos = j.find(n);
+    if (pos == std::string::npos) return "";
+    pos = j.find('"', pos + n.size());
+    if (pos == std::string::npos) return "";
+    size_t end = j.find('"', pos + 1);
+    return (end == std::string::npos) ? "" : j.substr(pos + 1, end - pos - 1);
+}
+
+static int json_int(const std::string& j, const std::string& key, int dflt) {
+    std::string n = "\"" + key + "\"";
+    size_t pos = j.find(n);
     if (pos == std::string::npos) return dflt;
-    pos = json.find(':', pos + needle.size());
-    if (pos == std::string::npos) return dflt;
-    size_t end = pos + 1;
-    while (end < json.size() && (json[end] == ' ' || json[end] == '\t')) ++end;
-    return std::atoi(json.c_str() + end);
+    pos = j.find(':', pos + n.size());
+    return (pos == std::string::npos) ? dflt : std::atoi(j.c_str() + pos + 1);
 }
 
-// JSON-escape a string.
 static std::string json_escape(const std::string& s) {
     std::string out;
-    out.reserve(s.size() + 2);
     for (char c : s) {
-        if (c == '"' || c == '\\') { out.push_back('\\'); out.push_back(c); }
+        if (c == '"') out += "\\\"";
+        else if (c == '\\') out += "\\\\";
         else if (c == '\n') out += "\\n";
         else if (c == '\r') out += "\\r";
         else if (c == '\t') out += "\\t";
-        else out.push_back(c);
+        else out += c;
     }
     return out;
 }
 
-// Detokenize: a placeholder reverse-map from token id to a word.
-static std::string detokenize(int token_id) {
-    if (token_id == 166101) return "";  // EOS
-    if (token_id == 166100) return "";  // BOS
-    if (token_id < 1000) return std::string(1, (char)('a' + (token_id % 26)));
-    // The simple_tokenize in viper_cli uses a deterministic hash. We
-    // reverse-map by recoding the same string formula. For v1 we just
-    // return a placeholder token id display.
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%d", token_id);
-    return std::string(buf);
-}
+static void handle_chat(SOCKET s, const std::string& body) {
+    std::string user_msg = json_string(body, "content");
+    int max_tokens = json_int(body, "max_tokens", 128);
+    if (max_tokens <= 0 || max_tokens > 2048) max_tokens = 128;
 
-static std::string generate_tokens(const std::string& prompt, int max_tokens) {
-    // For v1: respond with a placeholder generation. The actual model
-    // integration is in viper_cli; this server returns a useful echo
-    // response so the UI is functional end-to-end.
-    std::string out = "viper running on RTX 3070 Ti. Prompt: \"" + prompt +
-                      "\" — model loaded but inference wiring is in progress. " +
-                      "Engine smoke: 8 op kernels + sampling all PASS on GPU.";
-    return out;
-}
+    std::string full = "<|im_start|>user\n" + user_msg + "<|im_end|>\n<|im_start|>assistant\n";
+    std::vector<int32_t> ids = g_tok->encode(full);
 
-static void handle_chat_completions(SOCKET s, const std::string& body) {
-    std::string prompt = json_string(body, "content");
-    int max_tokens = json_int(body, "max_tokens", 64);
-    if (max_tokens <= 0 || max_tokens > 2048) max_tokens = 64;
+    write_all(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                 "Cache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\n"
+                 "Connection: close\r\n\r\n");
 
-    const char* headers =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/event-stream\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Connection: close\r\n"
-        "\r\n";
-    write_all(s, headers);
-
-    // Stream the response in chunks so the UI shows real progression.
-    std::string full = generate_tokens(prompt, max_tokens);
-    size_t chunk_size = 16;
-    for (size_t i = 0; i < full.size(); i += chunk_size) {
-        std::string chunk = full.substr(i, chunk_size);
-        char sse[2048];
-        snprintf(sse, sizeof(sse),
-            "data: {\"id\":\"chatcmpl-viper\","
-            "\"object\":\"chat.completion.chunk\","
-            "\"model\":\"Nanbeige4.2-3B\","
-            "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},"
-            "\"finish_reason\":null}]}\n\n",
-            json_escape(chunk).c_str());
-        write_all(s, sse);
-        Sleep(20);  // small delay so the UI sees typing
+    // Prefill
+    int32_t next = -1;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        bool last = (i + 1 == ids.size());
+        if (!g_engine->forward(ids[i], last, &next)) {
+            write_all(s, "data: {\"error\":\"forward failed\"}\n\n");
+            closesocket(s); return;
+        }
     }
-    write_all(s, "data: {\"id\":\"chatcmpl-viper\",\"object\":\"chat.completion.chunk\","
-                  "\"model\":\"Nanbeige4.2-3B\","
-                  "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
-    write_all(s, "data: [DONE]\n\n");
+
+    // Generate and stream
+    int n_gen = 0;
+    auto tg0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < max_tokens; ++i) {
+        if (next == g_tok->eos() || next == g_tok->im_end()) break;
+        std::string piece = g_tok->decode(next);
+        if (!piece.empty()) {
+            char sse[2048];
+            snprintf(sse, sizeof(sse),
+                "data: {\"id\":\"viper\",\"object\":\"chat.completion.chunk\","
+                "\"model\":\"Nanbeige4.2-3B\",\"choices\":[{\"index\":0,"
+                "\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
+                json_escape(piece).c_str());
+            write_all(s, sse);
+        }
+        ++n_gen;
+        if (!g_engine->forward(next, true, &next)) break;
+    }
+    auto tg1 = std::chrono::steady_clock::now();
+    double gen_s = std::chrono::duration<double>(tg1 - tg0).count();
+
+    char done[512];
+    snprintf(done, sizeof(done),
+        "data: {\"id\":\"viper\",\"object\":\"chat.completion.chunk\","
+        "\"model\":\"Nanbeige4.2-3B\",\"choices\":[{\"index\":0,"
+        "\"delta\":{},\"finish_reason\":\"stop\"}],"
+        "\"usage\":{\"prompt_tokens\":%zu,\"completion_tokens\":%d,"
+        "\"timing\":{\"gen_s\":%.2f,\"tps\":%.1f}}}\n\n"
+        "data: [DONE]\n\n",
+        ids.size(), n_gen, gen_s, gen_s > 0 ? n_gen / gen_s : 0.0);
+    write_all(s, done);
     closesocket(s);
+    g_engine->reset();
 }
 
 static void handle_client(SOCKET s) {
     std::string req = read_request(s);
     if (req.empty()) { closesocket(s); return; }
-
     size_t sp1 = req.find(' ');
     size_t sp2 = req.find(' ', sp1 + 1);
     if (sp1 == std::string::npos || sp2 == std::string::npos) {
         send_response(s, 400, "{\"error\":\"bad request\"}");
-        closesocket(s);
-        return;
+        closesocket(s); return;
     }
     std::string method = req.substr(0, sp1);
     std::string path = req.substr(sp1 + 1, sp2 - sp1 - 1);
 
     if (method == "GET" && path == "/") {
-        // Serve the UI.
-        std::string html = read_file(CHAT_HTML);
-        if (html.empty()) {
-            send_response(s, 500, "{\"error\":\"ui not found\"}");
-        } else {
-            std::string resp = "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/html; charset=utf-8\r\n"
-                "Content-Length: " + std::to_string(html.size()) + "\r\n"
-                "Cache-Control: no-cache\r\n"
-                "Connection: close\r\n"
-                "\r\n";
+        std::string html = read_file("D:/dev/viper/tools/serve/ui/chat.html");
+        if (html.empty()) html = read_file("D:/dev/viper/tools/serve/ui.html");
+        if (html.empty()) html = read_file("tools/serve/ui/chat.html");
+        if (html.empty()) { send_response(s, 500, "{\"error\":\"ui\"}"); }
+        else {
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+                "Content-Length: " + std::to_string(html.size()) + "\r\nConnection: close\r\n\r\n";
             write_all(s, resp + html);
         }
     } else if (method == "GET" && path == "/health") {
-        send_response(s, 200, "{\"status\":\"ok\",\"engine\":\"viper\",\"v1\":\"kernel layer verified\"}");
+        send_response(s, 200, "{\"status\":\"ok\",\"engine\":\"viper\"}");
     } else if (method == "GET" && path == "/v1/models") {
-        send_response(s, 200,
-            "{\"object\":\"list\","
-            "\"data\":[{\"id\":\"Nanbeige4.2-3B\",\"object\":\"model\","
-            "\"created\":1720000000,\"owned_by\":\"Nanbeige\"}]}");
+        send_response(s, 200, "{\"object\":\"list\",\"data\":[{\"id\":\"Nanbeige4.2-3B\"}]}");
     } else if (method == "POST" && path == "/v1/chat/completions") {
-        size_t body_pos = req.find("\r\n\r\n");
-        std::string body = (body_pos != std::string::npos) ? req.substr(body_pos + 4) : "";
-        handle_chat_completions(s, body);
-        return;  // handle_chat_completions closes the socket
+        size_t bp = req.find("\r\n\r\n");
+        handle_chat(s, (bp != std::string::npos) ? req.substr(bp + 4) : "");
+        return;
     } else if (method == "OPTIONS") {
-        const char* resp =
-            "HTTP/1.1 204 No Content\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
-            "\r\n";
-        write_all(s, resp);
+        write_all(s, "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n"
+                     "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                     "Access-Control-Allow-Headers: Content-Type\r\n\r\n");
     } else {
         send_response(s, 404, "{\"error\":\"not found\"}");
     }
@@ -243,36 +203,36 @@ static void handle_client(SOCKET s) {
 }
 
 int main(int argc, char** argv) {
+    std::string model_p = "D:/dev/viper/artifacts/Nanbeige4.2-3B.viper";
+    std::string vocab_p = "D:/dev/viper/artifacts/vocab.bin";
     int port = 8080;
-    if (argc > 1) port = std::atoi(argv[1]);
-    printf("viper_serve: starting on 127.0.0.1:%d\n", port);
-    printf("UI: %s\n", CHAT_HTML.c_str());
-
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        fprintf(stderr, "WSAStartup failed\n");
-        return 1;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--model") == 0 && i+1 < argc) model_p = argv[++i];
+        else if (std::strcmp(argv[i], "--vocab") == 0 && i+1 < argc) vocab_p = argv[++i];
+        else if (std::strcmp(argv[i], "--port") == 0 && i+1 < argc) port = std::atoi(argv[++i]);
     }
 
-    SOCKET server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (server == INVALID_SOCKET) { fprintf(stderr, "socket() failed\n"); return 1; }
+    g_tok = new viper::Tokenizer();
+    if (!g_tok->load(vocab_p)) { fprintf(stderr, "[serve] tok fail\n"); return 1; }
+    g_engine = new viper::NanbeigeEngine();
+    if (!g_engine->load(model_p)) { fprintf(stderr, "[serve] engine fail\n"); return 1; }
 
+    printf("[serve] viper loaded. Port %d. Open http://127.0.0.1:%d/\n", port, port);
+
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { fprintf(stderr, "WSA fail\n"); return 1; }
+    SOCKET server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (server == INVALID_SOCKET) return 1;
     int opt = 1;
     setsockopt(server, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
-
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(port);
     if (bind(server, (sockaddr*)&addr, sizeof(addr)) != 0) {
-        fprintf(stderr, "bind() failed: %d\n", WSAGetLastError());
-        return 1;
-    }
-    if (listen(server, 8) != 0) {
-        fprintf(stderr, "listen() failed\n");
-        return 1;
-    }
-    printf("viper_serve: listening. Open http://127.0.0.1:%d/ in a browser.\n", port);
+        fprintf(stderr, "bind fail: %d\n", WSAGetLastError()); return 1; }
+    if (listen(server, 8) != 0) return 1;
+    printf("[serve] listening on 127.0.0.1:%d\n", port);
 
     while (true) {
         SOCKET client = accept(server, nullptr, nullptr);
