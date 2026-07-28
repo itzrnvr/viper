@@ -77,21 +77,32 @@ add_library(viper_core STATIC
     src/viper/sampling.cpp
     src/viper/megakernel.cpp
 )
-target_include_directories(viper_core PUBLIC include)
+target_include_directories(viper_core PUBLIC include kernels)
 target_link_libraries(viper_core PUBLIC CUDA::cudart)
 
 # ---------------------------------------------------------------------------
-# Viper kernels library — INTERFACE stub. Main thread will convert this to a
-# STATIC library once kernels/ops/*.cu land. Until then it just propagates
-# include directories so CLI/serve/convert tools can link cleanly.
+# Viper kernels library — REAL CUDA kernels (sm_86, C++20, CUDA 12.8).
+# Each kernel has a .h interface (declared contract) and a .cu
+# implementation (the actual GPU code). The host-side stub in
+# src/viper/<op>.cpp forwards into the kernel via a wrapper.
 # ---------------------------------------------------------------------------
-add_library(viper_kernels INTERFACE)
-target_include_directories(viper_kernels INTERFACE include kernels)
-target_link_libraries(viper_kernels INTERFACE viper_core CUDA::cudart)
+add_library(viper_kernels STATIC
+    kernels/ops/rmsnorm_kernel.cu
+    kernels/ops/rope_kernel.cu
+    kernels/ops/embedding_kernel.cu
+    kernels/ops/swiglu_kernel.cu
+    kernels/ops/residual_kernel.cu
+)
+target_include_directories(viper_kernels PUBLIC include kernels)
+target_link_libraries(viper_kernels PUBLIC CUDA::cudart)
+# sm_86 only. We hard-fail at configure time on any other arch.
+set_target_properties(viper_kernels PROPERTIES
+    CUDA_ARCHITECTURES "86"
+    POSITION_INDEPENDENT_CODE OFF
+)
+target_link_libraries(viper_core PUBLIC viper_kernels)
 
 # ---------------------------------------------------------------------------
-# CLI tool — loads a placeholder .viper artifact, prints one token.
-# Safety: --max-iters/--max-tokens/--max-memory guards + NVML temperature gate.
 # ---------------------------------------------------------------------------
 add_executable(viper_cli tools/cli/main.cpp)
 target_link_libraries(viper_cli PRIVATE viper_core viper_kernels)

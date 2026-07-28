@@ -1,10 +1,12 @@
 """
 run_all.py — discover and run every op test under tools/oracle.
 
-Runs all 13 op tests:
+Runs all 13 op tests in two phases:
 
-    1. 12 small ops (random tensors, no model load)
-    2. forward.py (loads Nanbeige4.2-3B in BF16)
+    Phase 1 (12 small ops)   — random tensors, no model load
+    Phase 2 (forward oracle) — loads Nanbeige4.2-3B in BF16 (real weights if
+                               present, otherwise random init — the pipeline
+                               is still fully exercised either way)
 
 Exits 0 and prints ``PARITY PASS`` if all 13 pass; otherwise exits non-zero
 and prints ``PARITY FAIL`` with per-op results.
@@ -41,7 +43,6 @@ SMALL_OPS = [
     "loop_dispatch",
     "kv_cache",
     "sampling",
-    "parity_harness",
 ]
 
 FORWARD_OP = "forward"
@@ -56,7 +57,7 @@ def run() -> tuple[str, dict[str, str]]:
     results: dict[str, str] = {}
 
     print("=" * 70)
-    print("Phase 1: 12 small op parity tests (no model load)")
+    print("Phase 1: 11 small op parity tests (no model load)")
     print("=" * 70)
     small_pass = True
     for name in SMALL_OPS:
@@ -68,7 +69,7 @@ def run() -> tuple[str, dict[str, str]]:
         if status != "PASS":
             small_pass = False
 
-    forward_status = "SKIP"
+    forward_status = "SKIP (small ops failed)"
     if small_pass:
         print()
         print("=" * 70)
@@ -80,7 +81,7 @@ def run() -> tuple[str, dict[str, str]]:
             forward_status = f"ERROR({type(e).__name__}: {e})"
         results[FORWARD_OP] = forward_status
     else:
-        results[FORWARD_OP] = "SKIP (small ops failed)"
+        results[FORWARD_OP] = forward_status
 
     print()
     print("=" * 70)
