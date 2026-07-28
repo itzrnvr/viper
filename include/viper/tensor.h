@@ -4,17 +4,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <span>
-#include <string_view>
+#include <string>
 #include <vector>
 
 #include "viper/common.h"
 
 namespace viper {
 
-// ---------------------------------------------------------------------------
-// Data type enum (kept tiny: only what we need for v1).
-// ---------------------------------------------------------------------------
 enum class DType : int {
     FP32 = 0,
     BF16 = 1,
@@ -23,37 +19,36 @@ enum class DType : int {
     UINT8 = 4,
     INT32 = 5,
     UINT32 = 6,
-    Q4_G64 = 100,  // quant format registry ids
+    Q4_G64 = 100,
     Q5_G64 = 101,
     Q6_G64 = 102,
     W8_G32 = 103,
 };
 
-std::string_view dtype_name(DType d) noexcept;
+const char* dtype_name(DType d) noexcept;
 usize dtype_sizeof(DType d) noexcept;
 
-// ---------------------------------------------------------------------------
-// Shape
-// ---------------------------------------------------------------------------
 class Shape {
-  public:
+public:
     using Dim = i64;
-
     static constexpr usize kMaxDims = 8;
 
     Shape() = default;
     Shape(std::initializer_list<Dim> dims) {
         VIPER_ASSERT(dims.size() <= kMaxDims);
-        for (auto d : dims) dims_[rank_++] = d;
+        size_t i = 0;
+        for (auto d : dims) dims_[i++] = d;
+        rank_ = i;
     }
-    explicit Shape(std::span<const Dim> dims) {
-        VIPER_ASSERT(dims.size() <= kMaxDims);
-        for (auto d : dims) dims_[rank_++] = d;
+    // Pointer + size constructor (replaces std::span for MSVC 14.29 compat).
+    Shape(const Dim* dims, usize n) {
+        VIPER_ASSERT(n <= kMaxDims);
+        for (size_t i = 0; i < n; ++i) dims_[i] = dims[i];
+        rank_ = n;
     }
 
     Dim operator[](usize i) const noexcept { return dims_[i]; }
     Dim& operator[](usize i) noexcept { return dims_[i]; }
-
     usize rank() const noexcept { return rank_; }
     Dim dim(usize i) const noexcept { return dims_[i]; }
     i64 numel() const noexcept {
@@ -61,7 +56,6 @@ class Shape {
         for (usize i = 0; i < rank_; ++i) n *= dims_[i];
         return n;
     }
-
     bool operator==(const Shape& other) const noexcept {
         if (rank_ != other.rank_) return false;
         for (usize i = 0; i < rank_; ++i)
@@ -70,27 +64,23 @@ class Shape {
     }
     bool operator!=(const Shape& other) const noexcept { return !(*this == other); }
 
-    // Row-major contiguous: stride[i] = product(dims[i+1:]).
     std::array<Dim, kMaxDims> strides() const noexcept {
         std::array<Dim, kMaxDims> s{};
         Dim acc = 1;
-        for (i64 i = rank_ - 1; i >= 0; --i) {
-            s[i] = acc;
-            acc *= dims_[i];
+        for (i64 i = (i64)rank_ - 1; i >= 0; --i) {
+            s[(size_t)i] = acc;
+            acc *= dims_[(size_t)i];
         }
         return s;
     }
 
-  private:
+private:
     std::array<Dim, kMaxDims> dims_{};
     usize rank_ = 0;
 };
 
-// ---------------------------------------------------------------------------
-// Tensor — non-owning view over a device buffer.
-// ---------------------------------------------------------------------------
 class Tensor {
-  public:
+public:
     Tensor() = default;
     Tensor(void* data, DType dtype, Shape shape)
         : data_(data), dtype_(dtype), shape_(std::move(shape)) {}
@@ -106,30 +96,26 @@ class Tensor {
     bool is_contiguous() const noexcept {
         auto s = shape_.strides();
         i64 expected = 1;
-        for (i64 i = shape_.rank() - 1; i >= 0; --i) {
-            if (s[i] != expected) return false;
-            expected *= shape_[i];
+        for (i64 i = (i64)shape_.rank() - 1; i >= 0; --i) {
+            if (s[(size_t)i] != expected) return false;
+            expected *= shape_[(size_t)i];
         }
         return true;
     }
 
-    // Convenience helpers — typed pointer cast.
     template <typename T>
     T* data_as() const noexcept {
         return reinterpret_cast<T*>(data_);
     }
 
-  private:
+private:
     void* data_ = nullptr;
     DType dtype_ = DType::FP32;
     Shape shape_;
 };
 
-// ---------------------------------------------------------------------------
-// DeviceBuffer — owning device memory wrapper.
-// ---------------------------------------------------------------------------
 class DeviceBuffer {
-  public:
+public:
     DeviceBuffer() = default;
     explicit DeviceBuffer(usize nbytes) { alloc(nbytes); }
     ~DeviceBuffer() { free(); }
@@ -159,7 +145,7 @@ class DeviceBuffer {
     Status copy_from_host(const void* src, usize nbytes);
     Status copy_to_host(void* dst, usize nbytes) const;
 
-  private:
+private:
     void* ptr_ = nullptr;
     usize nbytes_ = 0;
 };
