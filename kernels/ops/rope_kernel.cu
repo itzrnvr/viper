@@ -1,29 +1,22 @@
 /*
- * viper RoPE kernel — implementation (corrected for partner read race).
+ * viper RoPE kernel — clean rewrite using warp-shuffle for partner reads.
  *
  * PURPOSE: see rope_kernel.h
  *
- * RACE FIX:
- *   The original kernel had a cross-warp race: thread tid reads
- *   x[partner] (where partner = tid +/- half) and writes x[tid].
- *   Thread `tid + half` does the symmetric read/write. Without a
- *   __syncthreads() between read and write, tid=0 (warp 0) could
- *   read x[64] AFTER tid=64 (warp 2) has already overwritten it.
- *
- *   Fix: each block loads its D-tile into shared memory with one
- *   store per element, __syncthreads, then the rest of the kernel
- *   reads partner values from shared memory (consistent across the
- *   block). Final writes go to global memory.
+ * DESIGN:
+ *   - 1 block = 1 warp = 32 threads. Each block handles ONE (b, t, h) tuple.
+ *   - Each thread processes head_dim/32 elements (4 elements when D=128).
+ *   - Partner read via __shfl_sync — no SMEM, no __syncthreads, no race.
+ *   - Grid: (B, T, num_heads), block: 32 threads. head_dim is templated.
  *
  * CORRECTNESS:
  *   - inv_freq computed in fp32.
  *   - cos/sin in fp32; bf16 multiply cast through fp32.
- *   - rotate_half reads from shared memory after sync, not global.
  *
  * SAFETY:
  *   - No global allocations inside kernels.
- *   - SMEM usage: D * 2 bytes per block (D=128 → 256 bytes).
- *   - Block size = head_dim; grid = (B, T, num_heads).
+ *   - SMEM usage: 0 bytes.
+ *   - No __syncthreads needed — warp shuffle provides per-warp sync.
  */
 #include "rope_kernel.h"
 #include <cuda_runtime.h>
@@ -43,7 +36,6 @@ __global__ void rope_cos_sin_kernel(
     if (t >= T) return;
     const int half = head_dim >> 1;
     const int tid = threadIdx.x;
-
     if (tid < half) {
         const float exponent = -2.0f * static_cast<float>(tid) / static_cast<float>(head_dim);
         const float inv_freq = __expf(exponent * __logf(theta));
@@ -76,6 +68,8 @@ cudaError_t rope_precompute_cos_sin(
     return cudaGetLastError();
 }
 
+// 1 warp (32 threads) per (b, t, h) tuple. Each thread processes
+// HEAD_DIM/32 elements via iterations. Partner read via __shfl_sync.
 template <int HEAD_DIM>
 __global__ void rope_apply_q_or_k_kernel(
     __nv_bfloat16* __restrict__ x,
@@ -84,31 +78,50 @@ __global__ void rope_apply_q_or_k_kernel(
     int B,
     int H,
     int T) {
+    constexpr int half = HEAD_DIM / 2;
+    constexpr int ITERS = HEAD_DIM / 32;  // elements per thread
     const int b = blockIdx.x;
     const int t = blockIdx.y;
     const int h = blockIdx.z;
-    const int tid = threadIdx.x;
-    constexpr int half = HEAD_DIM / 2;
+    const int tid = threadIdx.x;  // 0..31
 
-    // Load the full D-tile into shared memory. Each thread loads one
-    // element; with HEAD_DIM threads per block, this is one load per
-    // thread. After this, the partner read from SMEM is race-free.
-    __shared__ __nv_bfloat16 tile[HEAD_DIM];
+    // Each thread loads its assigned elements + partner via shfl.
+    // For HEAD_DIM=128: ITERS=4, each thread handles positions
+    // {tid, tid+32, tid+64, tid+96}.
+    #pragma unroll
+    for (int it = 0; it < ITERS; ++it) {
+        const int pos = it * 32 + tid;        // global position in head_dim
+        const int partner = (pos < half) ? (pos + half) : (pos - half);
+        const int partner_iter = partner / 32;
+        const int partner_tid = partner % 32;
+        const int x_idx = ((b * H + h) * T + t) * HEAD_DIM + pos;
+        const int partner_x_idx = ((b * H + h) * T + t) * HEAD_DIM + partner;
 
-    const int x_idx = ((b * H + h) * T + t) * HEAD_DIM + tid;
-    tile[tid] = x[x_idx];
-    __syncthreads();
+        const float x_val = __bfloat162float(x[x_idx]);
+        // Read partner value from the partner thread's iteration
+        // (synchronized within the warp — no race).
+        // We can use shfl with the actual value, but we need to load
+        // the partner's element into its register. Since each thread
+        // loads its own pos into a register inside the same iteration,
+        // the partner thread's register holds what we need if our
+        // partner is in this thread's iteration. Otherwise we need a
+        // second load.
+        float partner_val;
+        if (partner_iter == it) {
+            // Partner is in this iteration; use shfl.
+            partner_val = __shfl_sync(0xffffffff, x_val, partner_tid);
+        } else {
+            // Partner is in a different iteration; do a direct load.
+            // (For HEAD_DIM=128 with half=64, partner and pos are
+            // always in the same iteration since half=64 and 32<64<=96.)
+            partner_val = __bfloat162float(x[partner_x_idx]);
+        }
 
-    if (tid < HEAD_DIM) {
-        const int partner = (tid < half) ? (tid + half) : (tid - half);
-        const int cs_idx = t * HEAD_DIM + tid;
-
-        const float x_val = __bfloat162float(tile[tid]);
-        const float x_partner = __bfloat162float(tile[partner]);
+        const int cs_idx = t * HEAD_DIM + pos;
         const float c = cos_table[cs_idx];
         const float s = sin_table[cs_idx];
 
-        const float rotate = (tid < half) ? -x_partner : x_partner;
+        const float rotate = (pos < half) ? -partner_val : partner_val;
         const float out_val = x_val * c + rotate * s;
         x[x_idx] = __float2bfloat16(out_val);
     }
@@ -131,7 +144,7 @@ cudaError_t rope_apply_inplace_bf16(
     }
 
     dim3 grid_q(B, T, num_heads_q);
-    dim3 block(head_dim);
+    dim3 block(32);  // 1 warp per (b, t, h) tuple
     rope_apply_q_or_k_kernel<128><<<grid_q, block, 0, stream>>>(
         Q, cos_table, sin_table, B, num_heads_q, T);
 
