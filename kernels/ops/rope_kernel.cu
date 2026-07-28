@@ -1,27 +1,29 @@
 /*
- * viper RoPE kernel — implementation
+ * viper RoPE kernel — implementation (corrected for partner read race).
  *
  * PURPOSE: see rope_kernel.h
  *
- * IMPLEMENTATION:
- *   rope_precompute_cos_sin: one block per position. Each block has 128
- *   threads; the first half computes inv_freq and the angle, writes
- *   cos/sin to both halves of the head_dim row.
+ * RACE FIX:
+ *   The original kernel had a cross-warp race: thread tid reads
+ *   x[partner] (where partner = tid +/- half) and writes x[tid].
+ *   Thread `tid + half` does the symmetric read/write. Without a
+ *   __syncthreads() between read and write, tid=0 (warp 0) could
+ *   read x[64] AFTER tid=64 (warp 2) has already overwritten it.
  *
- *   rope_apply_inplace: one block per (b, t, head) tuple; blockDim.x =
- *   head_dim threads. Each thread reads its own Q/K element, fetches
- *   its partner via rotate_half semantics, multiplies by cos/sin,
- *   writes back.
+ *   Fix: each block loads its D-tile into shared memory with one
+ *   store per element, __syncthreads, then the rest of the kernel
+ *   reads partner values from shared memory (consistent across the
+ *   block). Final writes go to global memory.
  *
  * CORRECTNESS:
  *   - inv_freq computed in fp32.
  *   - cos/sin in fp32; bf16 multiply cast through fp32.
- *   - rotate_half: tid < half => partner = tid + half (and negate);
- *                  tid >= half => partner = tid - half (positive).
+ *   - rotate_half reads from shared memory after sync, not global.
  *
  * SAFETY:
  *   - No global allocations inside kernels.
- *   - SMEM usage: 0 bytes (streaming through registers).
+ *   - SMEM usage: D * 2 bytes per block (D=128 → 256 bytes).
+ *   - Block size = head_dim; grid = (B, T, num_heads).
  */
 #include "rope_kernel.h"
 #include <cuda_runtime.h>
@@ -74,36 +76,42 @@ cudaError_t rope_precompute_cos_sin(
     return cudaGetLastError();
 }
 
+template <int HEAD_DIM>
 __global__ void rope_apply_q_or_k_kernel(
     __nv_bfloat16* __restrict__ x,
     const float* __restrict__ cos_table,
     const float* __restrict__ sin_table,
     int B,
     int H,
-    int T,
-    int D) {
+    int T) {
     const int b = blockIdx.x;
     const int t = blockIdx.y;
     const int h = blockIdx.z;
     const int tid = threadIdx.x;
+    constexpr int half = HEAD_DIM / 2;
 
-    if (tid >= D) return;
+    // Load the full D-tile into shared memory. Each thread loads one
+    // element; with HEAD_DIM threads per block, this is one load per
+    // thread. After this, the partner read from SMEM is race-free.
+    __shared__ __nv_bfloat16 tile[HEAD_DIM];
 
-    const int half = D >> 1;
-    const int x_idx = ((b * H + h) * T + t) * D + tid;
+    const int x_idx = ((b * H + h) * T + t) * HEAD_DIM + tid;
+    tile[tid] = x[x_idx];
+    __syncthreads();
 
-    const int partner = (tid < half) ? (tid + half) : (tid - half);
-    const int partner_x_idx = ((b * H + h) * T + t) * D + partner;
-    const int cs_idx = t * D + tid;
+    if (tid < HEAD_DIM) {
+        const int partner = (tid < half) ? (tid + half) : (tid - half);
+        const int cs_idx = t * HEAD_DIM + tid;
 
-    const float x_val = __bfloat162float(x[x_idx]);
-    const float x_partner = __bfloat162float(x[partner_x_idx]);
-    const float c = cos_table[cs_idx];
-    const float s = sin_table[cs_idx];
+        const float x_val = __bfloat162float(tile[tid]);
+        const float x_partner = __bfloat162float(tile[partner]);
+        const float c = cos_table[cs_idx];
+        const float s = sin_table[cs_idx];
 
-    const float rotate = (tid < half) ? -x_partner : x_partner;
-    const float out_val = x_val * c + rotate * s;
-    x[x_idx] = __float2bfloat16(out_val);
+        const float rotate = (tid < half) ? -x_partner : x_partner;
+        const float out_val = x_val * c + rotate * s;
+        x[x_idx] = __float2bfloat16(out_val);
+    }
 }
 
 cudaError_t rope_apply_inplace_bf16(
@@ -124,12 +132,12 @@ cudaError_t rope_apply_inplace_bf16(
 
     dim3 grid_q(B, T, num_heads_q);
     dim3 block(head_dim);
-    rope_apply_q_or_k_kernel<<<grid_q, block, 0, stream>>>(
-        Q, cos_table, sin_table, B, num_heads_q, T, head_dim);
+    rope_apply_q_or_k_kernel<128><<<grid_q, block, 0, stream>>>(
+        Q, cos_table, sin_table, B, num_heads_q, T);
 
     dim3 grid_k(B, T, num_heads_kv);
-    rope_apply_q_or_k_kernel<<<grid_k, block, 0, stream>>>(
-        K, cos_table, sin_table, B, num_heads_kv, T, head_dim);
+    rope_apply_q_or_k_kernel<128><<<grid_k, block, 0, stream>>>(
+        K, cos_table, sin_table, B, num_heads_kv, T);
 
     return cudaGetLastError();
 }
