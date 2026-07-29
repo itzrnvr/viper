@@ -13,10 +13,9 @@ import struct
 import sys
 import json
 import os
-
 def write_packed(f, data):
-    """Write uint64 size + raw data."""
-    f.write(struct.pack('<Q', len(data)))
+    """Write uint64 size (in bytes) + raw data."""
+    f.write(struct.pack('<Q', data.nbytes))
     f.write(data.tobytes())
 
 def quantize_q4(weight, group_size=64):
@@ -84,23 +83,15 @@ def main():
             total_bytes += len(w) + len(s) * 2 + 16
             print(f"  {name}: {len(w)} bytes packed, {len(s)} scales")
 
-        # Also write lm_head
-        if 'lm_head_packed' in data:
-            write_packed(f, data['lm_head_packed'].astype(np.uint8))
-            write_packed(f, data['lm_head_scales'].astype(np.float16))
-            print(f"  lm_head: {len(data['lm_head_packed'])} bytes")
-        else:
-            # Quantize lm_head from embedding if shared
-            embed = data['embed'].astype(np.float32)
-            w, s = quantize_q4(embed)  # vocab × hidden
-            write_packed(f, w)
-            write_packed(f, s)
-            print(f"  lm_head (from embed): {len(w)} bytes")
-
-        # Embed (BF16)
+        # Embed (BF16) — loader reads embed BEFORE lm_head
         embed_bf16 = data['embed'].astype(np.float16)
         write_packed(f, embed_bf16)
-        print(f"  embed: {len(embed_bf16) * 2} bytes")
+        print(f"  embed: {len(embed_bf16)} values")
+
+        # lm_head (Q4 packed + scales)
+        write_packed(f, data['lm_head_packed'].astype(np.uint8))
+        write_packed(f, data['lm_head_scales'].astype(np.float16))
+        print(f"  lm_head: {len(data['lm_head_packed'])} bytes")
 
         # final_norm (BF16)
         fnorm = data['final_norm'].astype(np.float16)

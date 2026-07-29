@@ -28,6 +28,7 @@ public:
     int kv_max_seq = 2048;
 
     // Drafter weights (1 layer only)
+    ~Drafter() { for (void* p : gpu_allocs_) cudaFree(p); }
     GpuLayer layer;
     const __nv_bfloat16* embed = nullptr;
     GpuLinearQ4 lm_head;
@@ -67,7 +68,7 @@ public:
         map_view_ = (void*)view;
 
         const uint8_t* p = view;
-        if (fsz < 56 || memcmp(p, "VIPER", 5) != 0) return false;
+        if (fsz < 56 || memcmp(p, "VIPER", 5) != 0) { fprintf(stderr, "[drafter] bad magic\n"); return false; }
         p += 16;
         uint32_t hdr[10]; memcpy(hdr, p, 40); p += 40;
         cfg.n_layers = hdr[1]; cfg.n_passes = hdr[2];
@@ -77,6 +78,8 @@ public:
         cfg.rms_eps = 1e-5f; cfg.rope_theta = 70000000.0f;
 
         auto upload = [&](const uint8_t*& pp, void** dst) -> bool {
+        fprintf(stderr, "[drafter] hdr: layers=%d passes=%d hidden=%d hd=%d vocab=%d fsz=%zu\n",
+                cfg.n_layers, cfg.n_passes, cfg.hidden, cfg.head_dim, cfg.vocab, fsz);
             uint64_t sz; memcpy(&sz, pp, 8); pp += 8;
             void* d = nullptr;
             if (cudaMalloc(&d, sz) != cudaSuccess) return false;
@@ -97,12 +100,11 @@ public:
             if (!upload(p, (void**)&lins[i]->scales)) return false;
             lins[i]->out_f = linOut[i]; lins[i]->in_f = linIn[i];
         }
-        // embed, lm_head, final_norm
-        if (!upload(p, (void**)&embed)) return false;
-        if (!upload(p, (void**)&lm_head.packed)) return false;
-        if (!upload(p, (void**)&lm_head.scales)) return false;
-        lm_head.out_f = cfg.vocab; lm_head.in_f = cfg.hidden;
-        if (!upload(p, (void**)&final_norm)) return false;
+        // SKIP embed, lm_head, final_norm — shared with base model via set_shared()
+        // Just advance the file pointer past these sections
+        for (int skip = 0; skip < 4; ++skip) {  // embed, lm_packed, lm_scales, final_norm
+            uint64_t sz; memcpy(&sz, p, 8); p += 8 + sz;
+        }
         // Norms
         if (!upload(p, (void**)&layer.input_ln)) return false;
         if (!upload(p, (void**)&layer.post_ln)) return false;
@@ -141,6 +143,19 @@ public:
         return true;
     }
 
+    // Share embed/lm_head/final_norm with the base model (saves 1.3 GB VRAM)
+    void set_shared(const __nv_bfloat16* embed_ptr,
+                    const uint8_t* lm_packed, const __nv_bfloat16* lm_scales,
+                    int lm_out, int lm_in,
+                    const __nv_bfloat16* fnorm) {
+        embed = embed_ptr;
+        lm_head.packed = lm_packed;
+        lm_head.scales = lm_scales;
+        lm_head.out_f = lm_out;
+        lm_head.in_f = lm_in;
+        final_norm = fnorm;
+    }
+
     void reset() { seq_len_ = 0; }
     void rollback(int n) { seq_len_ -= n; }
 
@@ -166,14 +181,13 @@ public:
             cudaMemcpy(d_id_, &current_token, 4, cudaMemcpyHostToDevice);
             // h_ = h_ + embed[current_token]
             // (simplified: just use embed directly as input)
+            // EAGLE input: h_ = h_ + embed(token)
+            cudaMemcpy(d_id_, &current_token, 4, cudaMemcpyHostToDevice);
             DVK(ops::embedding_gather_bf16_i32(embed, d_id_, h_norm_, 1, 1, cfg.vocab, H, 0));
-            // Add: h_ = h_ + h_norm_ (element-wise add)
-            // Actually, for EAGLE: input = hidden + embed(token)
-            // We use a residual kernel or inline add
-            // For now: skip the add (use embed directly — will train to handle this)
+            DVK(ops::residual_add_inplace_bf16(h_, h_norm_, H, 0));
 
-            // rmsnorm
-            DVK(ops::rmsnorm_forward_bf16(h_norm_, layer.input_ln, h_norm_, 1, H, cfg.rms_eps, 0));
+            // rmsnorm on the combined input
+            DVK(ops::rmsnorm_forward_bf16(h_, layer.input_ln, h_norm_, 1, H, cfg.rms_eps, 0));
 
             // q_proj
             DVK(ops::linear_q4_g64_bf16(layer.q.packed, layer.q.scales, h_norm_, q_,
