@@ -276,6 +276,8 @@ public:
     }
 
     void reset() { seq_len_ = 0; }
+    // Expose hidden state for drafter (EAGLE spec decode).
+    const __nv_bfloat16* get_hidden() const { return x_; }
     int seq_len() const { return seq_len_; }
     void rollback(int n) { seq_len_ -= n; }  // undo rejected draft tokens
 

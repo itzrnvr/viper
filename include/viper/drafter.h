@@ -16,7 +16,7 @@
 
 #include "viper/model_impl.cuh"
 
-#define DDVK(call) do { cudaError_t e_ = (call); if (e_ != cudaSuccess) { \
+#define DVK(call) do { cudaError_t e_ = (call); if (e_ != cudaSuccess) { \
     std::fprintf(stderr, "[drafter] cuda error %s at %s:%d\n", \
         cudaGetErrorString(e_), __FILE__, __LINE__); return 0; } } while (0)
 
@@ -214,7 +214,7 @@ public:
                 1, layer.down.out_f, layer.down.in_f, 0));
 
             // Final norm
-            DVK(ops::rmsnorm_forward_bf16(h_, final_norm_, h_, 1, H, cfg.rms_eps, 0));
+            DVK(ops::rmsnorm_forward_bf16(h_, final_norm, h_, 1, H, cfg.rms_eps, 0));
 
             // lm_head + sample
             DVK(ops::linear_q4_g64_bf16(lm_head.packed, lm_head.scales, h_,

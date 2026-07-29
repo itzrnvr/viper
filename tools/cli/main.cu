@@ -23,6 +23,7 @@
 #include <chrono>
 
 #include "viper/model_impl.cuh"
+#include "viper/drafter.h"
 #include "viper/tokenizer.h"
 
 static std::string argval(int argc, char** argv, const char* key, const char* dflt) {
@@ -64,6 +65,7 @@ struct NgramCache {
 int main(int argc, char** argv) {
     std::string modelp = argval(argc, argv, "--model", "D:/dev/viper/artifacts/Nanbeige4.2-3B.viper");
     std::string vocabp = argval(argc, argv, "--vocab", "D:/dev/viper/artifacts/vocab.bin");
+    std::string drafterp = argval(argc, argv, "--drafter", "");
     std::string prompt  = argval(argc, argv, "--prompt", "Hello, who are you?");
     int max_tokens = std::atoi(argval(argc, argv, "--max-tokens", "128").c_str());
     int spec_k     = std::atoi(argval(argc, argv, "--spec-k", "4").c_str());
@@ -75,6 +77,16 @@ int main(int argc, char** argv) {
     viper::NanbeigeEngine engine;
     engine.max_batch = std::max(spec_k + 1, 5);
     if (!engine.load(modelp)) { std::fprintf(stderr, "[cli] engine load failed\n"); return 1; }
+
+    // Load EAGLE drafter if specified.
+    viper::Drafter* drafter = nullptr;
+    if (!drafterp.empty()) {
+        drafter = new viper::Drafter();
+        if (!drafter->load(drafterp)) {
+            std::fprintf(stderr, "[cli] drafter load failed, using n-gram fallback\n");
+            delete drafter; drafter = nullptr;
+        }
+    }
 
     // ChatML template.
     std::string full = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
@@ -140,9 +152,15 @@ int main(int argc, char** argv) {
         ++n_steps;
 
         if (spec_k > 0) {
-            // Draft K tokens: try n-gram first, fill with Jacobi fallback.
-            int n_drafted = ngram.draft(history, drafts, K);
-            for (int i = n_drafted; i < K; ++i) drafts[i] = 198;
+            // Draft K tokens: use EAGLE drafter if available, else n-gram.
+            if (drafter) {
+                drafter->reset();
+                const __nv_bfloat16* hidden = engine.get_hidden();
+                drafter->generate(hidden, next, drafts, K);
+            } else {
+                int n_drafted = ngram.draft(history, drafts, K);
+                for (int i = n_drafted; i < K; ++i) drafts[i] = 198;
+            }
 
             // Build batch: [next, draft1, ..., draftK]
             int32_t batch[MAX_K + 1];
