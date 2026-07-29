@@ -21,6 +21,7 @@ set "INCLUDE=%INCLUDE%;%PROJECT%;%PROJECT%\kernels"
     "%PROJECT%\kernels\ops\linear_bf16_kernel.cu" ^
     "%PROJECT%\kernels\ops\attn_decode_kernel.cu" ^
     "%PROJECT%\kernels\ops\sampling_kernel.cu" ^
+    "%PROJECT%\kernels\persistent_forward.cu" ^
     -o "%PROJECT%\build\viper_cli.exe"
 if errorlevel 1 ( echo nvcc FAILED & exit /b 1 )
 echo [OK  ] viper_cli.exe built

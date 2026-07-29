@@ -38,6 +38,7 @@
 #include "kernels/ops/linear_bf16_kernel.h"
 #include "kernels/ops/attn_decode_kernel.h"
 #include "kernels/ops/sampling_kernel.h"
+#include "kernels/persistent_forward.h"
 
 namespace viper {
 
@@ -61,8 +62,6 @@ struct GpuLinearQ4 {
 
 struct GpuLayer {
     GpuLinearQ4 q, k, v, o, gate, up, down;
-    GpuLinearQ4 kv;   // concatenated k+v: N=2*nKVh*HD, single GEMV call
-    GpuLinearQ4 gu;   // concatenated gate+up: N=2*I, single GEMV call
     const __nv_bfloat16* input_ln;
     const __nv_bfloat16* post_ln;
 };
@@ -210,10 +209,9 @@ public:
         if (!alloc((void**)&d_sample_, (size_t)MB * 4)) return false;
         if (!alloc((void**)&d_id_, (size_t)MB * 4)) return false;
         VK(ops::rope_precompute_cos_sin(cos_t_, sin_t_, 0, kv_max_seq, cfg.rope_theta, HD, 0));
-        VK(cudaDeviceSynchronize());  // DEBUG: check rope precompute
+        // (rope precompute sync not needed — kernels are on the same stream)
 
         // KV cache: position-major [n_kv, max_kv_len, hd] to match kernel.
-        // Each slot = max_kv_len * n_kv_heads * head_dim * 2 bytes.
         kv_slots_ = cfg.n_passes * cfg.n_layers;
         size_t slot_bytes = (size_t)kv_max_seq * cfg.n_kv_heads * HD * 2;
         kv_k_.resize(kv_slots_); kv_v_.resize(kv_slots_);
@@ -223,7 +221,14 @@ public:
         }
         std::printf("[viper] KV cache: %d slots x %d tok (%.2f GB)\n",
                     kv_slots_, kv_max_seq, 2.0 * kv_slots_ * slot_bytes / 1e9);
-        seq_len_ = 0;
+
+        // Device-side copies for persistent kernel.
+        if (!alloc((void**)&d_layers_, sizeof(GpuLayer) * cfg.n_layers)) return false;
+        cudaMemcpy((void*)d_layers_, layers_.data(), sizeof(GpuLayer) * cfg.n_layers, cudaMemcpyHostToDevice);
+        if (!alloc((void**)&d_kv_k_, sizeof(void*) * kv_slots_)) return false;
+        if (!alloc((void**)&d_kv_v_, sizeof(void*) * kv_slots_)) return false;
+        cudaMemcpy(d_kv_k_, kv_k_.data(), sizeof(void*) * kv_slots_, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_kv_v_, kv_v_.data(), sizeof(void*) * kv_slots_, cudaMemcpyHostToDevice);
         return true;
     }
 
@@ -237,6 +242,28 @@ public:
         const int pos = seq_len_;
         if (pos >= kv_max_seq) { std::fprintf(stderr, "[viper] context full\n"); return false; }
         return forward_impl(token, want_logits, out_token, pos, H, I, HD, nQ, nKVh);
+    }
+
+    // Persistent kernel forward: entire decode in ONE CUDA launch.
+    bool forward_persistent(int32_t token, int32_t* out_token) {
+        const int H = cfg.hidden, I = cfg.intermediate, HD = cfg.head_dim;
+        const int nQ = cfg.n_heads, nKVh = cfg.n_kv_heads;
+        const int pos = seq_len_;
+        if (pos >= kv_max_seq) return false;
+        const float* cos_pos = cos_t_ + (size_t)pos * HD;
+        const float* sin_pos = sin_t_ + (size_t)pos * HD;
+        const float attn_scale = 1.0f / std::sqrt((float)HD);
+        VK(ops::launch_persistent_decode(
+            d_layers_, cfg.n_layers, cfg.n_passes,
+            embed_, lm_head_q4_.packed, lm_head_q4_.scales, final_norm_,
+            x_, x_norm_, q_, kb_, attn_, g_, u_, logits_,
+            d_kv_k_, d_kv_v_,
+            cos_pos, sin_pos,
+            H, I, nQ, nKVh, HD, cfg.vocab, pos,
+            token, cfg.rms_eps, attn_scale,
+            d_sample_, 48, 0));  // persistent kernel (experimental, 48 blocks safe)
+        VK(cudaMemcpy(out_token, d_sample_, 4, cudaMemcpyDeviceToHost));
+        return true;
     }
 
     // Batch forward: process M tokens in a single pass (for spec decode).
@@ -371,6 +398,10 @@ private:
     int32_t* d_id_ = nullptr;
     int kv_slots_ = 0;
     std::vector<__nv_bfloat16*> kv_k_, kv_v_;
+    // Device-side copies for persistent kernel.
+    const GpuLayer* d_layers_ = nullptr;
+    __nv_bfloat16** d_kv_k_ = nullptr;
+    __nv_bfloat16** d_kv_v_ = nullptr;
     std::vector<void*> gpu_allocs_;
     void* map_view_ = nullptr;
     int seq_len_ = 0;
