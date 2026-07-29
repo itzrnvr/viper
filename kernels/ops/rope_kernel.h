@@ -78,6 +78,17 @@ cudaError_t rope_apply_inplace_bf16(
     int head_dim,
     cudaStream_t stream);
 
+
+// Apply rope to Q (in-place) and K (writes directly to KV cache).
+// Eliminates the separate k memcpy to cache.
+cudaError_t rope_apply_q_inplace_k_to_cache(
+    __nv_bfloat16* Q,
+    const __nv_bfloat16* K_src,
+    __nv_bfloat16* K_cache,
+    int pos, int nKV,
+    const float* cos_t, const float* sin_t,
+    int nQ, int nKVh, int T, int D,
+    cudaStream_t stream);
 }  // namespace ops
 }  // namespace viper
 

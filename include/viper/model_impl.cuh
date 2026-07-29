@@ -375,11 +375,10 @@ private:
                 VK(ops::linear_q4_g64_bf16_fused2_rmsnorm(lw.k.packed, lw.k.scales, lw.v.packed, lw.v.scales,
                                                            lw.input_ln, cfg.rms_eps, x_,
                                                            kb_, v_cache_ptr, 1, lw.k.out_f, lw.k.in_f, 0));
-                VK(ops::rope_apply_inplace_bf16(q_, kb_, cos_pos, sin_pos, 1, nQ, nKVh, 1, HD, 0));
-
-                // KV append: k via memcpy (rope applied), v was written directly by GEMV.
-                VK(cudaMemcpyAsync(kv_k_[slot] + (size_t)pos * nKVh * HD, kb_,
-                                   (size_t)nKVh * HD * 2, cudaMemcpyDeviceToDevice, 0));
+                // Fused rope + K-to-cache: eliminates separate k memcpy.
+                VK(ops::rope_apply_q_inplace_k_to_cache(
+                    q_, kb_, kv_k_[slot], pos, nKVh, cos_pos, sin_pos,
+                    nQ, nKVh, 1, HD, 0));
 
                 VK(ops::attn_decode_bf16(q_, kv_k_[slot], kv_v_[slot], attn_,
                                          nQ, nKVh, HD, pos + 1, attn_scale, 0));

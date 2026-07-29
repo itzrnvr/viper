@@ -155,5 +155,48 @@ cudaError_t rope_apply_inplace_bf16(
     return cudaGetLastError();
 }
 
+// Apply RoPE to K and write directly to KV cache (eliminates memcpy).
+// Q is still modified in-place by the existing kernel.
+__global__ void rope_k_to_cache_kernel(
+    const __nv_bfloat16* __restrict__ k_src,  // [nKV, D]
+    __nv_bfloat16* __restrict__ k_cache,       // [T, nKV, D]
+    int pos, int nKV,
+    const float* __restrict__ cos_t,
+    const float* __restrict__ sin_t,
+    int D) {
+    const int half = D / 2;
+    const int h = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (tid >= D) return;
+
+    int partner = (tid < half) ? (tid + half) : (tid - half);
+    float kv = __bfloat162float(k_src[h * D + tid]);
+    float kp = __bfloat162float(k_src[h * D + partner]);
+    float c = cos_t[tid], s = sin_t[tid];
+    float rotate = (tid < half) ? -kp : kp;
+
+    k_cache[(size_t)pos * nKV * D + h * D + tid] =
+        __float2bfloat16(kv * c + rotate * s);
+}
+
+cudaError_t rope_apply_q_inplace_k_to_cache(
+    __nv_bfloat16* Q,              // modified in-place
+    const __nv_bfloat16* K_src,    // read-only (k_proj output before rope)
+    __nv_bfloat16* K_cache,        // write target (KV cache slot)
+    int pos, int nKV,
+    const float* cos_t, const float* sin_t,
+    int nQ, int nKVh, int T, int D,
+    cudaStream_t stream) {
+    if (D != 128) return cudaErrorInvalidValue;
+    // Q: standard in-place rope
+    dim3 grid_q(1, T, nQ);
+    rope_apply_q_or_k_kernel<128><<<grid_q, 32, 0, stream>>>(
+        Q, cos_t, sin_t, 1, nQ, T);
+    // K: rope + write to cache (no separate memcpy needed)
+    rope_k_to_cache_kernel<<<nKVh, 128, 0, stream>>>(
+        K_src, K_cache, pos, nKV, cos_t, sin_t, D);
+    return cudaGetLastError();
+}
+
 }  // namespace ops
 }  // namespace viper
