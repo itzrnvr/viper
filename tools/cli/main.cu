@@ -31,6 +31,36 @@ static std::string argval(int argc, char** argv, const char* key, const char* df
     return dflt;
 }
 
+// ---- N-gram cache for speculative drafting ----
+struct NgramCache {
+    static constexpr int N = 2;
+    static constexpr int SIZE = 1 << 16;
+    static constexpr int MASK = SIZE - 1;
+    struct Entry { uint32_t hash; int32_t value; };
+    std::vector<Entry> table;
+    NgramCache() : table(SIZE, {0, -1}) {}
+    static uint32_t hash2(int32_t a, int32_t b) {
+        uint32_t h = 2166136261u; h ^= (uint32_t)a; h *= 16777619u;
+        h ^= (uint32_t)b; h *= 16777619u; return h;
+    }
+    void add(int32_t a, int32_t b, int32_t next) {
+        uint32_t h = hash2(a, b) & MASK; table[h] = {h + 1, next};
+    }
+    int32_t lookup(int32_t a, int32_t b) const {
+        uint32_t h = hash2(a, b) & MASK; const Entry& e = table[h];
+        return (e.hash == h + 1) ? e.value : -1;
+    }
+    int draft(const std::vector<int32_t>& hist, int32_t* out, int max_k) const {
+        int n = hist.size(); if (n < N) return 0;
+        int32_t a = hist[n-2], b = hist[n-1]; int k = 0;
+        while (k < max_k) { int32_t v = lookup(a, b); if (v < 0) break; out[k++] = v; a = b; b = v; }
+        return k;
+    }
+    void ingest(const std::vector<int32_t>& tokens) {
+        for (int i = 0; i + N < (int)tokens.size(); ++i) add(tokens[i], tokens[i+1], tokens[i+2]);
+    }
+};
+
 int main(int argc, char** argv) {
     std::string modelp = argval(argc, argv, "--model", "D:/dev/viper/artifacts/Nanbeige4.2-3B.viper");
     std::string vocabp = argval(argc, argv, "--vocab", "D:/dev/viper/artifacts/vocab.bin");
@@ -87,18 +117,19 @@ int main(int argc, char** argv) {
     auto t1 = std::chrono::steady_clock::now();
     double ttft = std::chrono::duration<double>(t1 - t0).count();
 
-    // Jacobi speculative decoding.
+    // N-gram speculative decoding.
     constexpr int MAX_K = 8;
     int K = std::min(spec_k, MAX_K);
-
-    // Draft buffer: initialized with space token (common continuation).
-    // Will be updated with model predictions each step.
     int32_t drafts[MAX_K];
-    int32_t prev_preds[MAX_K + 1];  // predictions from last batch
-    bool have_preds = false;
 
-    // Initialize drafts to a common token (newline/space)
-    for (int i = 0; i < K; ++i) drafts[i] = 198;  // '\n' in most tokenizers
+    // Build n-gram cache from prompt + generation history.
+    NgramCache ngram;
+    ngram.ingest(ids);
+    std::vector<int32_t> history(ids.begin(), ids.end());
+    history.push_back(next);
+
+    // Initialize drafts from n-gram cache.
+    for (int i = 0; i < K; ++i) drafts[i] = 198;
 
     int n_gen = 0;
     int n_steps = 0, n_accepted_total = 0, n_batch_steps = 0;
@@ -109,7 +140,11 @@ int main(int argc, char** argv) {
         ++n_steps;
 
         if (spec_k > 0) {
-            // Build batch: [next, draft1, draft2, ..., draftK]
+            // Draft K tokens: try n-gram first, fill with Jacobi fallback.
+            int n_drafted = ngram.draft(history, drafts, K);
+            for (int i = n_drafted; i < K; ++i) drafts[i] = 198;
+
+            // Build batch: [next, draft1, ..., draftK]
             int32_t batch[MAX_K + 1];
             batch[0] = next;
             for (int i = 0; i < K; ++i) batch[i + 1] = drafts[i];
@@ -119,10 +154,6 @@ int main(int argc, char** argv) {
             if (engine.forward_batch(batch, M, predicted)) {
                 ++n_batch_steps;
 
-                // Accept longest matching prefix.
-                // predicted[0] should be the real next token (given `next`)
-                // predicted[i] is the model's prediction given draft[i]
-                // Accept draft[i] if predicted[i] == draft[i]
                 int accepted = 0;
                 for (int i = 0; i < K; ++i) {
                     if (predicted[i] == drafts[i]) accepted++;
@@ -130,13 +161,9 @@ int main(int argc, char** argv) {
                 }
                 n_accepted_total += accepted;
 
-                // Roll back rejected draft tokens from KV cache.
                 if (K - accepted > 0)
                     engine.rollback(K - accepted);
 
-                // Commit 1 + accepted tokens.
-                // predicted[0] is always committed (it's the verified next token).
-                // predicted[1..accepted] are also committed (verified drafts).
                 for (int i = 0; i <= accepted; ++i) {
                     int32_t t = predicted[i];
                     if (t == tok.eos() || t == tok.im_end()) goto done;
@@ -145,22 +172,13 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     ++n_gen;
                     if (n_gen >= max_tokens) goto done;
+                    // Update n-gram cache + history.
+                    int h = history.size();
+                    if (h >= 2) ngram.add(history[h-2], history[h-1], t);
+                    history.push_back(t);
                 }
 
-                // Update next token.
                 next = predicted[accepted];
-
-                // Update drafts: use predictions from this step.
-                // predicted[accepted+1..K] are predictions for positions after
-                // the accepted tokens. Use them as next step's drafts.
-                for (int i = 0; i < K; ++i) {
-                    int src = accepted + 1 + i;
-                    if (src <= K)
-                        drafts[i] = predicted[src];
-                    else
-                        drafts[i] = 198;  // fallback
-                }
-                have_preds = true;
                 continue;
             }
         }
