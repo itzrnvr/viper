@@ -181,6 +181,8 @@ __global__ void rope_k_to_cache_kernel(
 
 // Fused Q-rope + K-to-cache in a single kernel launch.
 // Grid: (nQ + nKVh) blocks, 128 threads. Q blocks use first 32 threads.
+// Fused Q-rope + K-to-cache in a single kernel launch.
+// Uses SMEM exchange for Q to avoid in-place write race conditions.
 __global__ void rope_q_k_fused_kernel(
     __nv_bfloat16* __restrict__ Q,
     const __nv_bfloat16* __restrict__ K_src,
@@ -192,18 +194,22 @@ __global__ void rope_q_k_fused_kernel(
     constexpr int half = D / 2;
     const int bid = blockIdx.x;
     const int tid = threadIdx.x;
+
+    __shared__ float sx[128];
+
     if (bid < nQ) {
-        // Q rope in-place: 128 threads, 1 per dimension
+        // Q rope in-place: pre-load to SMEM to avoid write race
         const int h = bid;
-        const int d = tid;  // 0-127
-        const int partner = (d < half) ? (d + half) : (d - half);
-        float xv = __bfloat162float(Q[h * D + d]);
-        float pv = __bfloat162float(Q[h * D + partner]);
-        float c = cos_t[d], s = sin_t[d];
-        float rot = (d < half) ? -pv : pv;
-        Q[h * D + d] = __float2bfloat16(xv * c + rot * s);
+        sx[tid] = __bfloat162float(Q[h * D + tid]);
+        __syncthreads();
+        const int partner = (tid < half) ? (tid + half) : (tid - half);
+        float xv = sx[tid];
+        float pv = sx[partner];
+        float c = cos_t[tid], s = sin_t[tid];
+        float rot = (tid < half) ? -pv : pv;
+        Q[h * D + tid] = __float2bfloat16(xv * c + rot * s);
     } else {
-        // K rope + write to cache: 128 threads, 1 per dim
+        // K rope + write to cache (source is read-only, no race)
         if (tid >= D) return;
         const int h = bid - nQ;
         int partner = (tid < half) ? (tid + half) : (tid - half);
@@ -224,11 +230,9 @@ cudaError_t rope_apply_q_inplace_k_to_cache(
     int nQ, int nKVh, int T, int D,
     cudaStream_t stream) {
     if (D != 128) return cudaErrorInvalidValue;
-    // Q: standard in-place rope
     dim3 grid_q(1, T, nQ);
     rope_apply_q_or_k_kernel<128><<<grid_q, 32, 0, stream>>>(
         Q, cos_t, sin_t, 1, nQ, T);
-    // K: rope + write to cache (no separate memcpy needed)
     rope_k_to_cache_kernel<<<nKVh, 128, 0, stream>>>(
         K_src, K_cache, pos, nKV, cos_t, sin_t, D);
     return cudaGetLastError();
