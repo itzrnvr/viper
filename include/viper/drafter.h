@@ -8,16 +8,17 @@
  * Combined with multi-M batch verify: ~140-260 tok/s effective.
  *
  * Usage:
- *   Drafter drafter;
- *   drafter.load("drafter.viper");
- *   // After base model forward:
- *   int K = drafter.generate(hidden_state, token, K_out, max_K);
- *   // K_out has K draft tokens ready for batch verification
+ *   Drafter drafter; drafter.load("drafter.viper");
+ *   int K = drafter.generate(hidden, token, drafts, 4);
  */
 #ifndef VIPER_DRAFTER_H
 #define VIPER_DRAFTER_H
 
 #include "viper/model_impl.cuh"
+
+#define DDVK(call) do { cudaError_t e_ = (call); if (e_ != cudaSuccess) { \
+    std::fprintf(stderr, "[drafter] cuda error %s at %s:%d\n", \
+        cudaGetErrorString(e_), __FILE__, __LINE__); return 0; } } while (0)
 
 namespace viper {
 
@@ -165,61 +166,61 @@ public:
             cudaMemcpy(d_id_, &current_token, 4, cudaMemcpyHostToDevice);
             // h_ = h_ + embed[current_token]
             // (simplified: just use embed directly as input)
-            VK(ops::embedding_gather_bf16_i32(embed, d_id_, h_norm_, 1, 1, cfg.vocab, H, 0));
+            DVK(ops::embedding_gather_bf16_i32(embed, d_id_, h_norm_, 1, 1, cfg.vocab, H, 0));
             // Add: h_ = h_ + h_norm_ (element-wise add)
             // Actually, for EAGLE: input = hidden + embed(token)
             // We use a residual kernel or inline add
             // For now: skip the add (use embed directly — will train to handle this)
 
             // rmsnorm
-            VK(ops::rmsnorm_forward_bf16(h_norm_, layer.input_ln, h_norm_, 1, H, cfg.rms_eps, 0));
+            DVK(ops::rmsnorm_forward_bf16(h_norm_, layer.input_ln, h_norm_, 1, H, cfg.rms_eps, 0));
 
             // q_proj
-            VK(ops::linear_q4_g64_bf16(layer.q.packed, layer.q.scales, h_norm_, q_,
+            DVK(ops::linear_q4_g64_bf16(layer.q.packed, layer.q.scales, h_norm_, q_,
                                        1, layer.q.out_f, layer.q.in_f, 0));
             // k_proj
-            VK(ops::linear_q4_g64_bf16(layer.k.packed, layer.k.scales, h_norm_, kb_,
+            DVK(ops::linear_q4_g64_bf16(layer.k.packed, layer.k.scales, h_norm_, kb_,
                                        1, layer.k.out_f, layer.k.in_f, 0));
             // v_proj → KV cache
             __nv_bfloat16* v_ptr = kv_v_[0] + (size_t)pos * nKVh * HD;
-            VK(ops::linear_q4_g64_bf16(layer.v.packed, layer.v.scales, h_norm_, v_ptr,
+            DVK(ops::linear_q4_g64_bf16(layer.v.packed, layer.v.scales, h_norm_, v_ptr,
                                        1, layer.v.out_f, layer.v.in_f, 0));
 
             // rope + k to cache
             const float* cos_pos = cos_t_ + (size_t)pos * HD;
             const float* sin_pos = sin_t_ + (size_t)pos * HD;
-            VK(ops::rope_apply_q_inplace_k_to_cache(
+            DVK(ops::rope_apply_q_inplace_k_to_cache(
                 q_, kb_, kv_k_[0], pos, nKVh, cos_pos, sin_pos,
                 nQ, nKVh, 1, HD, 0));
 
             // attention
             float attn_scale = 1.0f / sqrtf((float)HD);
-            VK(ops::attn_decode_bf16(q_, kv_k_[0], kv_v_[0], attn_,
+            DVK(ops::attn_decode_bf16(q_, kv_k_[0], kv_v_[0], attn_,
                                      nQ, nKVh, HD, pos + 1, attn_scale, 0));
 
             // o_proj + residual
-            VK(ops::linear_q4_g64_bf16_residual(layer.o.packed, layer.o.scales,
+            DVK(ops::linear_q4_g64_bf16_residual(layer.o.packed, layer.o.scales,
                                                 attn_, h_, h_, 1, layer.o.out_f, layer.o.in_f, 0));
 
             // MLP: gate+up
-            VK(ops::linear_q4_g64_bf16_fused2_rmsnorm(
+            DVK(ops::linear_q4_g64_bf16_fused2_rmsnorm(
                 layer.gate.packed, layer.gate.scales,
                 layer.up.packed, layer.up.scales,
                 layer.post_ln, cfg.rms_eps, h_, g_, u_,
                 1, layer.gate.out_f, layer.gate.in_f, 0));
             // swiglu + down + residual
-            VK(ops::linear_q4_g64_bf16_residual_swiglu(
+            DVK(ops::linear_q4_g64_bf16_residual_swiglu(
                 layer.down.packed, layer.down.scales, g_, u_, h_, h_,
                 1, layer.down.out_f, layer.down.in_f, 0));
 
             // Final norm
-            VK(ops::rmsnorm_forward_bf16(h_, final_norm_, h_, 1, H, cfg.rms_eps, 0));
+            DVK(ops::rmsnorm_forward_bf16(h_, final_norm_, h_, 1, H, cfg.rms_eps, 0));
 
             // lm_head + sample
-            VK(ops::linear_q4_g64_bf16(lm_head.packed, lm_head.scales, h_,
+            DVK(ops::linear_q4_g64_bf16(lm_head.packed, lm_head.scales, h_,
                                        logits_, 1, cfg.vocab, H, 0));
-            VK(ops::sampling_greedy_bf16(logits_, d_sample_, 1, cfg.vocab, 0));
-            VK(cudaMemcpy(&out_tokens[k], d_sample_, 4, cudaMemcpyDeviceToHost));
+            DVK(ops::sampling_greedy_bf16(logits_, d_sample_, 1, cfg.vocab, 0));
+            DVK(cudaMemcpy(&out_tokens[k], d_sample_, 4, cudaMemcpyDeviceToHost));
 
             current_token = out_tokens[k];
             ++pos;
@@ -229,7 +230,7 @@ public:
         return max_k;
     }
 
-#undef VK
+#undef DVK
 };
 
 }  // namespace viper
