@@ -69,7 +69,10 @@ int main(int argc, char** argv) {
     std::string prompt  = argval(argc, argv, "--prompt", "Hello, who are you?");
     int max_tokens = std::atoi(argval(argc, argv, "--max-tokens", "128").c_str());
     int spec_k     = std::atoi(argval(argc, argv, "--spec-k", "4").c_str());
-    int fast_mode  = std::atoi(argval(argc, argv, "--fast", "0").c_str());
+    int fastMode  = std::atoi(argval(argc, argv, "--fast", "0").c_str());
+    int usePersistent = std::atoi(argval(argc, argv, "--persistent", "0").c_str());
+    int useGraph = std::atoi(argval(argc, argv, "--graph", "0").c_str());
+    if (usePersistent > 0 || useGraph > 0) spec_k = 0;  // graph/persistent: single-token decode
 
     viper::Tokenizer tok;
     if (!tok.load(vocabp)) { std::fprintf(stderr, "[cli] tok load failed\n"); return 1; }
@@ -78,7 +81,7 @@ int main(int argc, char** argv) {
     viper::NanbeigeEngine engine;
     engine.max_batch = std::max(spec_k + 1, 5);
     if (!engine.load(modelp)) { std::fprintf(stderr, "[cli] engine load failed\n"); return 1; }
-    if (fast_mode > 0) {
+    if (fastMode > 0) {
         engine.cfg.n_passes = 1;  // loop-0 only: halves weight reads
         std::printf("[cli] FAST MODE: n_passes=1 (22 layers, ~2x speed)\n");
     }
@@ -220,7 +223,13 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         ++n_gen;
 
-        if (!engine.forward(next, true, &next)) return 1;
+        if (useGraph > 0) {
+            if (!engine.forward_graph(next, &next)) return 1;
+        } else if (usePersistent > 0) {
+            if (!engine.forward_persistent(next, &next)) return 1;
+        } else {
+            if (!engine.forward(next, true, &next)) return 1;
+        }
     }
 
 done:

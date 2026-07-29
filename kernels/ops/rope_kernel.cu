@@ -179,6 +179,42 @@ __global__ void rope_k_to_cache_kernel(
         __float2bfloat16(kv * c + rotate * s);
 }
 
+// Fused Q-rope + K-to-cache in a single kernel launch.
+// Grid: (nQ + nKVh) blocks, 128 threads. Q blocks use first 32 threads.
+__global__ void rope_q_k_fused_kernel(
+    __nv_bfloat16* __restrict__ Q,
+    const __nv_bfloat16* __restrict__ K_src,
+    __nv_bfloat16* __restrict__ K_cache,
+    int pos, int nKV, int nQ,
+    const float* __restrict__ cos_t,
+    const float* __restrict__ sin_t) {
+    constexpr int D = 128;
+    constexpr int half = D / 2;
+    const int bid = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (bid < nQ) {
+        // Q rope in-place: 128 threads, 1 per dimension
+        const int h = bid;
+        const int d = tid;  // 0-127
+        const int partner = (d < half) ? (d + half) : (d - half);
+        float xv = __bfloat162float(Q[h * D + d]);
+        float pv = __bfloat162float(Q[h * D + partner]);
+        float c = cos_t[d], s = sin_t[d];
+        float rot = (d < half) ? -pv : pv;
+        Q[h * D + d] = __float2bfloat16(xv * c + rot * s);
+    } else {
+        // K rope + write to cache: 128 threads, 1 per dim
+        if (tid >= D) return;
+        const int h = bid - nQ;
+        int partner = (tid < half) ? (tid + half) : (tid - half);
+        float kv = __bfloat162float(K_src[h * D + tid]);
+        float kp = __bfloat162float(K_src[h * D + partner]);
+        float c = cos_t[tid], s = sin_t[tid];
+        float rot = (tid < half) ? -kp : kp;
+        K_cache[(size_t)pos * nKV * D + h * D + tid] =
+            __float2bfloat16(kv * c + rot * s);
+    }
+}
 cudaError_t rope_apply_q_inplace_k_to_cache(
     __nv_bfloat16* Q,              // modified in-place
     const __nv_bfloat16* K_src,    // read-only (k_proj output before rope)

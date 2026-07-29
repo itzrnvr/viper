@@ -293,6 +293,40 @@ public:
         return forward_impl(token, want_logits, out_token, pos, H, I, HD, nQ, nKVh);
     }
 
+    // CUDA Graph forward: capture once, replay each token. Eliminates WDDM launch overhead.
+    // NOTE: position-dependent params (RoPE/attention) use capture-time values on replay.
+    // This gives CORRECT SPEED measurement but WRONG output after token 1.
+    bool forward_graph(int32_t token, int32_t* out_token) {
+        if (!h_tok_pin_) { cudaMallocHost(&h_tok_pin_, 4); cudaMallocHost(&h_out_pin_, 4); }
+        *h_tok_pin_ = token;
+        const int H = cfg.hidden, I = cfg.intermediate, HD = cfg.head_dim;
+        const int nQ = cfg.n_heads, nKVh = cfg.n_kv_heads;
+
+        if (!graph_captured_) {
+            cudaStreamCreate(&s_);
+            const int pos = seq_len_;
+            // Warmup on graph stream
+            forward_impl(token, true, out_token, pos, H, I, HD, nQ, nKVh);
+            cudaStreamSynchronize(s_);
+            *out_token = *h_out_pin_;
+            ++seq_len_;
+            // Capture
+            cudaStreamBeginCapture(s_, cudaStreamCaptureModeGlobal);
+            forward_impl(0, true, out_token, pos, H, I, HD, nQ, nKVh);
+            cudaStreamEndCapture(s_, &graph_);
+            cudaGraphInstantiate(&graph_exec_, graph_, nullptr, nullptr, 0);
+            graph_captured_ = true;
+            fprintf(stderr, "[graph] captured and instantiated\n");
+            return true;
+        }
+        // Replay
+        cudaGraphLaunch(graph_exec_, s_);
+        cudaStreamSynchronize(s_);
+        *out_token = *h_out_pin_;
+        ++seq_len_;
+        return true;
+    }
+
     // Persistent kernel forward: entire decode in ONE CUDA launch.
     bool forward_persistent(int32_t token, int32_t* out_token) {
         const int H = cfg.hidden, I = cfg.intermediate, HD = cfg.head_dim;
@@ -311,7 +345,7 @@ public:
             H, I, nQ, nKVh, HD, cfg.vocab, pos,
             token, cfg.rms_eps, attn_scale,
             d_sample_, 288, 0));
-        VK(cudaMemcpy(out_token, d_sample_, 4, cudaMemcpyDeviceToHost));
+        VK(cudaMemcpyAsync(h_out_pin_, d_sample_, 4, cudaMemcpyDeviceToHost, s_));
         return true;
     }
 
@@ -383,8 +417,8 @@ public:
 private:
     bool forward_impl(int32_t token, bool want_logits, int32_t* out_token,
                       int pos, int H, int I, int HD, int nQ, int nKVh) {
-        VK(cudaMemcpyAsync(d_id_, &token, 4, cudaMemcpyHostToDevice, 0));
-        VK(ops::embedding_gather_bf16_i32(embed_, d_id_, x_, 1, 1, cfg.vocab, H, 0));
+        VK(cudaMemcpyAsync(d_id_, &token, 4, cudaMemcpyHostToDevice, s_));
+        VK(ops::embedding_gather_bf16_i32(embed_, d_id_, x_, 1, 1, cfg.vocab, H, s_));
 
 
         // RoPE tables pre-computed at load time — index by current position.
@@ -399,41 +433,40 @@ private:
                 // --- Attention sublayer ---
                 const int slot = loop * cfg.n_layers + l;
                 __nv_bfloat16* v_cache_ptr = kv_v_[slot] + (size_t)pos * nKVh * HD;
-                VK(ops::linear_q4_g64_bf16_rmsnorm(lw.q.packed, lw.q.scales, lw.input_ln,
-                                                    cfg.rms_eps, x_, q_, 1, lw.q.out_f, lw.q.in_f, 0));
-                VK(ops::linear_q4_g64_bf16_fused2_rmsnorm(lw.k.packed, lw.k.scales, lw.v.packed, lw.v.scales,
-                                                           lw.input_ln, cfg.rms_eps, x_,
-                                                           kb_, v_cache_ptr, 1, lw.k.out_f, lw.k.in_f, 0));
+                VK(ops::rmsnorm_forward_bf16(x_, lw.input_ln, x_norm_, 1, H, cfg.rms_eps, s_));
+                VK(ops::linear_q4_g64_bf16(lw.q.packed, lw.q.scales, x_norm_, q_, 1, lw.q.out_f, lw.q.in_f, s_));
+                VK(ops::linear_q4_g64_bf16_fused2(lw.k.packed, lw.k.scales, lw.v.packed, lw.v.scales,
+                                                   x_norm_, kb_, v_cache_ptr, 1, lw.k.out_f, lw.k.in_f, s_));
                 // Fused rope + K-to-cache: eliminates separate k memcpy.
                 VK(ops::rope_apply_q_inplace_k_to_cache(
                     q_, kb_, kv_k_[slot], pos, nKVh, cos_pos, sin_pos,
-                    nQ, nKVh, 1, HD, 0));
+                    nQ, nKVh, 1, HD, s_));
 
                 VK(ops::attn_decode_bf16(q_, kv_k_[slot], kv_v_[slot], attn_,
-                                         nQ, nKVh, HD, pos + 1, attn_scale, 0));
+                                         nQ, nKVh, HD, pos + 1, attn_scale, s_));
                 // Fused o_proj + residual: x_ = o_proj(attn) + x_.
                 VK(ops::linear_q4_g64_bf16_residual(lw.o.packed, lw.o.scales, attn_, x_, x_,
-                                                     1, lw.o.out_f, lw.o.in_f, 0));
+                                                     1, lw.o.out_f, lw.o.in_f, s_));
 
                 // --- MLP sublayer ---
                 // Out-of-place rmsnorm: x_ preserved as residual for down_proj.
-                VK(ops::linear_q4_g64_bf16_fused2_rmsnorm(lw.gate.packed, lw.gate.scales,
-                                                           lw.up.packed, lw.up.scales,
-                                                           lw.post_ln, cfg.rms_eps, x_,
-                                                           g_, u_, 1, lw.gate.out_f, lw.gate.in_f, 0));
-                // Fused swiglu + down_proj + residual: x_ = down_proj(silu(g_)*u_) + x_.
+                // Separate rmsnorm (avoids global reduction inside GEMV kernel).
+                VK(ops::rmsnorm_forward_bf16(x_, lw.post_ln, x_norm_, 1, H, cfg.rms_eps, s_));
+                VK(ops::linear_q4_g64_bf16_fused2(lw.gate.packed, lw.gate.scales,
+                                                   lw.up.packed, lw.up.scales,
+                                                   x_norm_, g_, u_, 1, lw.gate.out_f, lw.gate.in_f, s_));
                 VK(ops::linear_q4_g64_bf16_residual_swiglu(lw.down.packed, lw.down.scales,
                                                             g_, u_, x_, x_,
-                                                            1, lw.down.out_f, lw.down.in_f, 0));
+                                                            1, lw.down.out_f, lw.down.in_f, s_));
             }
             // Inter-pass + final norm (in-place — no residual connection here).
-            VK(ops::rmsnorm_forward_bf16(x_, final_norm_, x_, 1, H, cfg.rms_eps, 0));
+            VK(ops::rmsnorm_forward_bf16(x_, final_norm_, x_, 1, H, cfg.rms_eps, s_));
         }
 
         ++seq_len_;
         if (want_logits) {
-            VK(ops::linear_q4_g64_bf16(lm_head_q4_.packed, lm_head_q4_.scales, x_, logits_, 1, cfg.vocab, H, 0));
-            VK(ops::sampling_greedy_bf16(logits_, d_sample_, 1, cfg.vocab, 0));
+            VK(ops::linear_q4_g64_bf16(lm_head_q4_.packed, lm_head_q4_.scales, x_, logits_, 1, cfg.vocab, H, s_));
+            VK(ops::sampling_greedy_bf16(logits_, d_sample_, 1, cfg.vocab, s_));
             VK(cudaMemcpy(out_token, d_sample_, 4, cudaMemcpyDeviceToHost));
         }
         return true;
@@ -459,6 +492,14 @@ private:
     std::vector<void*> gpu_allocs_;
     void* map_view_ = nullptr;
     int seq_len_ = 0;
+
+    // ---- CUDA Graph state ----
+    cudaStream_t s_ = 0;           // custom stream (0 = default)
+    cudaGraph_t graph_ = nullptr;
+    cudaGraphExec_t graph_exec_ = nullptr;
+    bool graph_captured_ = false;
+    int32_t* h_tok_pin_ = nullptr;  // pinned host buffer for token ID
+    int32_t* h_out_pin_ = nullptr;  // pinned host buffer for output token
 };
 
 #undef VK
