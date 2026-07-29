@@ -417,6 +417,12 @@ public:
 private:
     bool forward_impl(int32_t token, bool want_logits, int32_t* out_token,
                       int pos, int H, int I, int HD, int nQ, int nKVh) {
+        static int prof_count = 0;
+        static cudaEvent_t ev[8];
+        static bool ev_init = false;
+        const bool prof = want_logits && (++prof_count % 100 == 0);
+        if (prof && !ev_init) { for (int i=0;i<8;i++) cudaEventCreate(&ev[i]); ev_init=true; }
+        if (prof) cudaEventRecord(ev[0], s_);
         VK(cudaMemcpyAsync(d_id_, &token, 4, cudaMemcpyHostToDevice, s_));
         VK(ops::embedding_gather_bf16_i32(embed_, d_id_, x_, 1, 1, cfg.vocab, H, s_));
 
@@ -426,6 +432,7 @@ private:
         const float* sin_pos = sin_t_ + (size_t)pos * HD;
 
         const float attn_scale = 1.0f / std::sqrt((float)HD);
+        if (prof) cudaEventRecord(ev[1], s_);
         for (int loop = 0; loop < cfg.n_passes; ++loop) {
             for (int l = 0; l < cfg.n_layers; ++l) {
                 const GpuLayer& lw = layers_[l];
@@ -437,6 +444,7 @@ private:
                 VK(ops::linear_q4_g64_bf16(lw.q.packed, lw.q.scales, x_norm_, q_, 1, lw.q.out_f, lw.q.in_f, s_));
                 VK(ops::linear_q4_g64_bf16_fused2(lw.k.packed, lw.k.scales, lw.v.packed, lw.v.scales,
                                                    x_norm_, kb_, v_cache_ptr, 1, lw.k.out_f, lw.k.in_f, s_));
+                if (prof && l == 0 && loop == 0) cudaEventRecord(ev[2], s_);
                 // Fused rope + K-to-cache: eliminates separate k memcpy.
                 VK(ops::rope_apply_q_inplace_k_to_cache(
                     q_, kb_, kv_k_[slot], pos, nKVh, cos_pos, sin_pos,
@@ -444,9 +452,11 @@ private:
 
                 VK(ops::attn_decode_bf16(q_, kv_k_[slot], kv_v_[slot], attn_,
                                          nQ, nKVh, HD, pos + 1, attn_scale, s_));
+                if (prof && l == 0 && loop == 0) cudaEventRecord(ev[3], s_);
                 // Fused o_proj + residual: x_ = o_proj(attn) + x_.
                 VK(ops::linear_q4_g64_bf16_residual(lw.o.packed, lw.o.scales, attn_, x_, x_,
                                                      1, lw.o.out_f, lw.o.in_f, s_));
+                if (prof && l == 0 && loop == 0) cudaEventRecord(ev[4], s_);
 
                 // --- MLP sublayer ---
                 // Out-of-place rmsnorm: x_ preserved as residual for down_proj.
@@ -458,6 +468,7 @@ private:
                 VK(ops::linear_q4_g64_bf16_residual_swiglu(lw.down.packed, lw.down.scales,
                                                             g_, u_, x_, x_,
                                                             1, lw.down.out_f, lw.down.in_f, s_));
+                if (prof && l == 0 && loop == 0) cudaEventRecord(ev[5], s_);
             }
             // Inter-pass + final norm (in-place — no residual connection here).
             VK(ops::rmsnorm_forward_bf16(x_, final_norm_, x_, 1, H, cfg.rms_eps, s_));
@@ -465,9 +476,20 @@ private:
 
         ++seq_len_;
         if (want_logits) {
+            if (prof) cudaEventRecord(ev[6], s_);
             VK(ops::linear_q4_g64_bf16(lm_head_q4_.packed, lm_head_q4_.scales, x_, logits_, 1, cfg.vocab, H, s_));
             VK(ops::sampling_greedy_bf16(logits_, d_sample_, 1, cfg.vocab, s_));
             VK(cudaMemcpy(out_token, d_sample_, 4, cudaMemcpyDeviceToHost));
+            if (prof) {
+                cudaEventRecord(ev[7], s_);
+                cudaStreamSynchronize(s_);
+                float t[7];
+                for (int i=0;i<7;i++) cudaEventElapsedTime(&t[i], ev[i], ev[i+1]);
+                float total = t[0]+t[1]+t[2]+t[3]+t[4]+t[5]+t[6];
+                printf("[prof] embed=%.0fus step_qkv=%.0fus rope_attn=%.0fus oproj=%.0fus mlp=%.0fus rest43=%.1fms lmhead=%.0fus total=%.1fms (%.1f tok/s)\n",
+                    t[0]*1000, t[1]*1000, t[2]*1000, t[3]*1000, t[4]*1000, t[5], t[6]*1000,
+                    total, 1000.0/total);
+            }
         }
         return true;
     }
