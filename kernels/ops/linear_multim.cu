@@ -178,5 +178,38 @@ cudaError_t linear_q4_multim_residual(
     return cudaGetLastError();
 }
 
+// Public quantize function
+cudaError_t quantize_to_q8(
+    const __nv_bfloat16* x, int8_t* xq, float* xs,
+    int M, int K, cudaStream_t stream) {
+    if (!x || !xq || !xs || M <= 0 || K <= 0) return cudaErrorInvalidValue;
+    quantize_activations_kernel<<<M, 256, 0, stream>>>(x, xq, xs, M, K);
+    return cudaGetLastError();
+}
+
+// DP4A GEMV with pre-quantized activations (no quantize inside, no SMEM, no sync)
+cudaError_t linear_q4_dp4a_prequantized(
+    const uint8_t* w, const __nv_bfloat16* s,
+    const int8_t* xq, const float* xs,
+    __nv_bfloat16* y,
+    int M, int N, int K, cudaStream_t stream) {
+    if (!w || !s || !xq || !xs || !y || M <= 0 || N <= 0 || K <= 0 || M > 16)
+        return cudaErrorInvalidValue;
+    linear_q4_dp4a_multim_kernel<<<(N+7)/8, 256, 0, stream>>>(
+        w, s, xq, xs, y, nullptr, M, N, K);
+    return cudaGetLastError();
+}
+
+cudaError_t linear_q4_dp4a_prequantized_residual(
+    const uint8_t* w, const __nv_bfloat16* s,
+    const int8_t* xq, const float* xs,
+    __nv_bfloat16* y, const __nv_bfloat16* residual,
+    int M, int N, int K, cudaStream_t stream) {
+    if (!w || !s || !xq || !xs || !y || !residual || M <= 0 || N <= 0 || K <= 0 || M > 16)
+        return cudaErrorInvalidValue;
+    linear_q4_dp4a_multim_kernel<<<(N+7)/8, 256, 0, stream>>>(
+        w, s, xq, xs, y, residual, M, N, K);
+    return cudaGetLastError();
+}
 }  // namespace ops
 }  // namespace viper
