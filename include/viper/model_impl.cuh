@@ -315,21 +315,18 @@ private:
                 const GpuLayer& lw = layers_[l];
 
                 // --- Attention sublayer ---
-                // Out-of-place rmsnorm: x_ preserved as residual for o_proj.
+                const int slot = loop * cfg.n_layers + l;
+                __nv_bfloat16* v_cache_ptr = kv_v_[slot] + (size_t)pos * nKVh * HD;
                 VK(ops::linear_q4_g64_bf16_rmsnorm(lw.q.packed, lw.q.scales, lw.input_ln,
                                                     cfg.rms_eps, x_, q_, 1, lw.q.out_f, lw.q.in_f, 0));
                 VK(ops::linear_q4_g64_bf16_fused2_rmsnorm(lw.k.packed, lw.k.scales, lw.v.packed, lw.v.scales,
                                                            lw.input_ln, cfg.rms_eps, x_,
-                                                           kb_, vb_, 1, lw.k.out_f, lw.k.in_f, 0));
+                                                           kb_, v_cache_ptr, 1, lw.k.out_f, lw.k.in_f, 0));
                 VK(ops::rope_apply_inplace_bf16(q_, kb_, cos_pos, sin_pos, 1, nQ, nKVh, 1, HD, 0));
 
-                // KV append.
-                const int slot = loop * cfg.n_layers + l;
-                const size_t row_bytes = (size_t)nKVh * HD * 2;
-                VK(cudaMemcpyAsync(kv_k_[slot] + (size_t)pos * nKVh * HD, kb_, row_bytes,
-                                   cudaMemcpyDeviceToDevice, 0));
-                VK(cudaMemcpyAsync(kv_v_[slot] + (size_t)pos * nKVh * HD, vb_, row_bytes,
-                                   cudaMemcpyDeviceToDevice, 0));
+                // KV append: k via memcpy (rope applied), v was written directly by GEMV.
+                VK(cudaMemcpyAsync(kv_k_[slot] + (size_t)pos * nKVh * HD, kb_,
+                                   (size_t)nKVh * HD * 2, cudaMemcpyDeviceToDevice, 0));
 
                 VK(ops::attn_decode_bf16(q_, kv_k_[slot], kv_v_[slot], attn_,
                                          nQ, nKVh, HD, pos + 1, attn_scale, 0));
