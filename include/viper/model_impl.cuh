@@ -366,6 +366,7 @@ public:
                                        x_ + (size_t)m * H, logits_, 1, cfg.vocab, H, 0));
             VK(ops::sampling_greedy_bf16(logits_, d_sample_ + m, 1, cfg.vocab, 0));
         }
+        VK(cudaMemcpy(out_tokens, d_sample_, M * sizeof(int32_t), cudaMemcpyDeviceToHost));
         return true;
     }
 
