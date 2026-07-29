@@ -61,6 +61,8 @@ struct GpuLinearQ4 {
 
 struct GpuLayer {
     GpuLinearQ4 q, k, v, o, gate, up, down;
+    GpuLinearQ4 kv;   // concatenated k+v: N=2*nKVh*HD, single GEMV call
+    GpuLinearQ4 gu;   // concatenated gate+up: N=2*I, single GEMV call
     const __nv_bfloat16* input_ln;
     const __nv_bfloat16* post_ln;
 };
@@ -263,10 +265,8 @@ public:
                 VK(ops::rmsnorm_forward_bf16(x_, lw.input_ln, x_norm_, M, H, cfg.rms_eps, 0));
                 VK(ops::linear_q4_g64_bf16(lw.q.packed, lw.q.scales, x_norm_, q_,
                                            M, lw.q.out_f, lw.q.in_f, 0));
-                VK(ops::linear_q4_g64_bf16(lw.k.packed, lw.k.scales, x_norm_, kb_,
-                                           M, lw.k.out_f, lw.k.in_f, 0));
-                VK(ops::linear_q4_g64_bf16(lw.v.packed, lw.v.scales, x_norm_, vb_,
-                                           M, lw.v.out_f, lw.v.in_f, 0));
+                VK(ops::linear_q4_g64_bf16_fused2(lw.k.packed, lw.k.scales, lw.v.packed, lw.v.scales,
+                                                   x_norm_, kb_, vb_, M, lw.k.out_f, lw.k.in_f, 0));
                 VK(ops::rope_apply_inplace_bf16(q_, kb_, cos_pos, sin_pos,
                                                  1, nQ, nKVh, M, HD, 0));
 
@@ -282,10 +282,8 @@ public:
 
                 // --- MLP sublayer (batch) ---
                 VK(ops::rmsnorm_forward_bf16(x_, lw.post_ln, x_norm_, M, H, cfg.rms_eps, 0));
-                VK(ops::linear_q4_g64_bf16(lw.gate.packed, lw.gate.scales, x_norm_, g_,
-                                           M, lw.gate.out_f, lw.gate.in_f, 0));
-                VK(ops::linear_q4_g64_bf16(lw.up.packed, lw.up.scales, x_norm_, u_,
-                                           M, lw.up.out_f, lw.up.in_f, 0));
+                VK(ops::linear_q4_g64_bf16_fused2(lw.gate.packed, lw.gate.scales, lw.up.packed, lw.up.scales,
+                                                   x_norm_, g_, u_, M, lw.gate.out_f, lw.gate.in_f, 0));
                 VK(ops::swiglu_inplace_bf16(g_, u_, M * I, 0));
                 VK(ops::linear_q4_g64_bf16_residual(lw.down.packed, lw.down.scales, g_, x_, x_,
                                                      M, lw.down.out_f, lw.down.in_f, 0));
@@ -320,8 +318,8 @@ private:
                 // Out-of-place rmsnorm: x_ preserved as residual for o_proj.
                 VK(ops::rmsnorm_forward_bf16(x_, lw.input_ln, x_norm_, 1, H, cfg.rms_eps, 0));
                 VK(ops::linear_q4_g64_bf16(lw.q.packed, lw.q.scales, x_norm_, q_, 1, lw.q.out_f, lw.q.in_f, 0));
-                VK(ops::linear_q4_g64_bf16(lw.k.packed, lw.k.scales, x_norm_, kb_, 1, lw.k.out_f, lw.k.in_f, 0));
-                VK(ops::linear_q4_g64_bf16(lw.v.packed, lw.v.scales, x_norm_, vb_, 1, lw.v.out_f, lw.v.in_f, 0));
+                VK(ops::linear_q4_g64_bf16_fused2(lw.k.packed, lw.k.scales, lw.v.packed, lw.v.scales,
+                                                   x_norm_, kb_, vb_, 1, lw.k.out_f, lw.k.in_f, 0));
                 VK(ops::rope_apply_inplace_bf16(q_, kb_, cos_pos, sin_pos, 1, nQ, nKVh, 1, HD, 0));
 
                 // KV append.
@@ -341,10 +339,8 @@ private:
                 // --- MLP sublayer ---
                 // Out-of-place rmsnorm: x_ preserved as residual for down_proj.
                 VK(ops::rmsnorm_forward_bf16(x_, lw.post_ln, x_norm_, 1, H, cfg.rms_eps, 0));
-                VK(ops::linear_q4_g64_bf16(lw.gate.packed, lw.gate.scales, x_norm_, g_,
-                                           1, lw.gate.out_f, lw.gate.in_f, 0));
-                VK(ops::linear_q4_g64_bf16(lw.up.packed, lw.up.scales, x_norm_, u_,
-                                           1, lw.up.out_f, lw.up.in_f, 0));
+                VK(ops::linear_q4_g64_bf16_fused2(lw.gate.packed, lw.gate.scales, lw.up.packed, lw.up.scales,
+                                                   x_norm_, g_, u_, 1, lw.gate.out_f, lw.gate.in_f, 0));
                 VK(ops::swiglu_inplace_bf16(g_, u_, I, 0));
                 // Fused down_proj + residual: x_ = down_proj(swiglu) + x_.
                 VK(ops::linear_q4_g64_bf16_residual(lw.down.packed, lw.down.scales, g_, x_, x_,

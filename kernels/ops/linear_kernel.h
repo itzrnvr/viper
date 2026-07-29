@@ -72,6 +72,16 @@ cudaError_t linear_q4_g64_bf16_residual(
     int M, int N, int K,
     cudaStream_t stream);
 
+// Fused 2-matrix GEMV: processes two weight matrices in a single launch.
+// Both matrices must have the same N, K. Outputs go to separate buffers.
+cudaError_t linear_q4_g64_bf16_fused2(
+    const uint8_t* __restrict__ w0, const __nv_bfloat16* __restrict__ s0,
+    const uint8_t* __restrict__ w1, const __nv_bfloat16* __restrict__ s1,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y0, __nv_bfloat16* __restrict__ y1,
+    int M, int N, int K,
+    cudaStream_t stream);
+
 }  // namespace ops
 }  // namespace viper
 
