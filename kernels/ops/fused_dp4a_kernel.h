@@ -1,6 +1,6 @@
 #ifndef VIPER_FUSED_DP4A_KERNEL_H
 #define VIPER_FUSED_DP4A_KERNEL_H
-#include <cuda_bf1616.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 namespace viper {
