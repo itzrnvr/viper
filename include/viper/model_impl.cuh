@@ -47,6 +47,8 @@
 #include "kernels/ops/sampling_kernel.h"
 #include "kernels/ops/linear_multim.h"
 #include "kernels/persistent_forward.h"
+#include "kernels/ops/rmsnorm_quantize.h"
+#include "kernels/ops/dp4a_smem_kernel.h"
 
 namespace viper {
 
@@ -431,45 +433,35 @@ private:
 
         const float attn_scale = 1.0f / std::sqrt((float)HD);
         if (prof) cudaEventRecord(ev[1], s_);
+        if (!d_q8_) { cudaMalloc(&d_q8_, 10752); cudaMalloc(&d_q8s_, 168*sizeof(float)); }
         for (int loop = 0; loop < cfg.n_passes; ++loop) {
             for (int l = 0; l < cfg.n_layers; ++l) {
                 const GpuLayer& lw = layers_[l];
 
-                // --- Attention sublayer ---
+                // --- Attention sublayer (DP4A) ---
                 const int slot = loop * cfg.n_layers + l;
                 __nv_bfloat16* v_cache_ptr = kv_v_[slot] + (size_t)pos * nKVh * HD;
-                VK(ops::rmsnorm_forward_bf16(x_, lw.input_ln, x_norm_, 1, H, cfg.rms_eps, s_));
-                VK(ops::linear_q4_g64_bf16(lw.q.packed, lw.q.scales, x_norm_, q_, 1, lw.q.out_f, lw.q.in_f, s_));
-                VK(ops::linear_q4_g64_bf16_fused2(lw.k.packed, lw.k.scales, lw.v.packed, lw.v.scales,
-                                                   x_norm_, kb_, v_cache_ptr, 1, lw.k.out_f, lw.k.in_f, s_));
+                VK(ops::rmsnorm_quantize_bf16(x_, lw.input_ln, x_norm_, d_q8_, d_q8s_, H, cfg.rms_eps, s_));
+                VK(ops::dp4a_smem_gemv(lw.q.packed, lw.q.scales, d_q8_, d_q8s_, q_, 1, lw.q.out_f, lw.q.in_f, s_));
+                VK(ops::dp4a_smem_gemv_fused2(lw.k.packed, lw.k.scales, lw.v.packed, lw.v.scales,
+                                               d_q8_, d_q8s_, kb_, v_cache_ptr, 1, lw.k.out_f, lw.k.in_f, s_));
                 if (prof && l == 0 && loop == 0) cudaEventRecord(ev[2], s_);
-                // Fused rope + K-to-cache: eliminates separate k memcpy.
-                // Fused rope (ZERO __syncthreads): Q→vb_, K→cache in 1 launch
-                VK(ops::rope_q_k_fused(
-                    q_, vb_, kb_, kv_k_[slot], pos, nKVh, nQ, nKVh,
-                    cos_pos, sin_pos, HD, s_));
-
-                VK(ops::attn_decode_bf16(vb_, kv_k_[slot], kv_v_[slot], attn_,
-                                         nQ, nKVh, HD, pos + 1, attn_scale, s_));
+                VK(ops::rope_q_k_fused(q_, vb_, kb_, kv_k_[slot], pos, nKVh, nQ, nKVh, cos_pos, sin_pos, HD, s_));
+                VK(ops::attn_decode_bf16(vb_, kv_k_[slot], kv_v_[slot], attn_, nQ, nKVh, HD, pos + 1, attn_scale, s_));
                 if (prof && l == 0 && loop == 0) cudaEventRecord(ev[3], s_);
-                // Fused o_proj + residual: x_ = o_proj(attn) + x_.
-                VK(ops::linear_q4_g64_bf16_residual(lw.o.packed, lw.o.scales, attn_, x_, x_,
-                                                     1, lw.o.out_f, lw.o.in_f, s_));
+                VK(ops::quantize_to_q8(attn_, d_q8_, d_q8s_, 1, nQ * HD, s_));
+                VK(ops::dp4a_smem_gemv_residual(lw.o.packed, lw.o.scales, d_q8_, d_q8s_, x_, x_, 1, lw.o.out_f, lw.o.in_f, s_));
                 if (prof && l == 0 && loop == 0) cudaEventRecord(ev[4], s_);
 
-                // --- MLP sublayer ---
-                // Out-of-place rmsnorm: x_ preserved as residual for down_proj.
-                // Separate rmsnorm (avoids global reduction inside GEMV kernel).
-                VK(ops::rmsnorm_forward_bf16(x_, lw.post_ln, x_norm_, 1, H, cfg.rms_eps, s_));
-                VK(ops::linear_q4_g64_bf16_fused2(lw.gate.packed, lw.gate.scales,
-                                                   lw.up.packed, lw.up.scales,
-                                                   x_norm_, g_, u_, 1, lw.gate.out_f, lw.gate.in_f, s_));
-                VK(ops::linear_q4_g64_bf16_residual_swiglu(lw.down.packed, lw.down.scales,
-                                                            g_, u_, x_, x_,
-                                                            1, lw.down.out_f, lw.down.in_f, s_));
+                // --- MLP sublayer (DP4A) ---
+                VK(ops::rmsnorm_quantize_bf16(x_, lw.post_ln, x_norm_, d_q8_, d_q8s_, H, cfg.rms_eps, s_));
+                VK(ops::dp4a_smem_gemv_fused2(lw.gate.packed, lw.gate.scales, lw.up.packed, lw.up.scales,
+                                               d_q8_, d_q8s_, g_, u_, 1, lw.gate.out_f, lw.gate.in_f, s_));
+                VK(ops::swiglu_inplace_bf16(g_, u_, I, s_));
+                VK(ops::quantize_to_q8(g_, d_q8_, d_q8s_, 1, I, s_));
+                VK(ops::dp4a_smem_gemv_residual(lw.down.packed, lw.down.scales, d_q8_, d_q8s_, x_, x_, 1, lw.down.out_f, lw.down.in_f, s_));
                 if (prof && l == 0 && loop == 0) cudaEventRecord(ev[5], s_);
             }
-            // Inter-pass + final norm (in-place — no residual connection here).
             VK(ops::rmsnorm_forward_bf16(x_, final_norm_, x_, 1, H, cfg.rms_eps, s_));
         }
 
@@ -513,6 +505,9 @@ private:
     std::vector<void*> gpu_allocs_;
     void* map_view_ = nullptr;
     int seq_len_ = 0;
+    // Q8 activation buffers for DP4A GEMV (lazy allocated)
+    int8_t* d_q8_ = nullptr;
+    float* d_q8s_ = nullptr;
 
     // ---- CUDA Graph state ----
     cudaStream_t s_ = 0;           // custom stream (0 = default)

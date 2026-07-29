@@ -23,6 +23,8 @@ set "INCLUDE=%INCLUDE%;%PROJECT%;%PROJECT%\kernels"
     "%PROJECT%\kernels\ops\sampling_kernel.cu" ^
     "%PROJECT%\kernels\persistent_forward.cu" ^
     "%PROJECT%\kernels\ops\fused_dp4a_kernel.cu" ^
+    "%PROJECT%\kernels\ops\rmsnorm_quantize.cu" ^
+    "%PROJECT%\kernels\ops\dp4a_smem_kernel.cu" ^
     "%PROJECT%\kernels\ops\linear_multim.cu" ^
     -o "%PROJECT%\build\viper_cli.exe"
 if errorlevel 1 ( echo nvcc FAILED & exit /b 1 )
