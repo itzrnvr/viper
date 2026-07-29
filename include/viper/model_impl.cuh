@@ -201,7 +201,7 @@ public:
         if (!alloc((void**)&attn_, (size_t)MB * nQ * 2)) return false;
         if (!alloc((void**)&g_, (size_t)MB * I * 2)) return false;
         if (!alloc((void**)&u_, (size_t)MB * I * 2)) return false;
-        if (!alloc((void**)&logits_, (size_t)MB * cfg.vocab * 2)) return false;
+        if (!alloc((void**)&logits_, (size_t)cfg.vocab * 2)) return false;  // M=1 (sequential lm_head)
         // Pre-compute RoPE cos/sin tables for all positions.
         if (!alloc((void**)&cos_t_, (size_t)kv_max_seq * HD * 4)) return false;
         if (!alloc((void**)&sin_t_, (size_t)kv_max_seq * HD * 4)) return false;
@@ -318,9 +318,12 @@ public:
         }
 
         seq_len_ += M;
-        VK(ops::linear_q4_g64_bf16(lm_head_q4_.packed, lm_head_q4_.scales, x_, logits_, M, cfg.vocab, H, 0));
-        VK(ops::sampling_greedy_bf16(logits_, d_sample_, M, cfg.vocab, 0));
-        VK(cudaMemcpy(out_tokens, d_sample_, M * 4, cudaMemcpyDeviceToHost));
+        // Sequential lm_head + sampling: keeps logits_ at M=1 size (no bloat).
+        for (int m = 0; m < M; ++m) {
+            VK(ops::linear_q4_g64_bf16(lm_head_q4_.packed, lm_head_q4_.scales,
+                                       x_ + (size_t)m * H, logits_, 1, cfg.vocab, H, 0));
+            VK(ops::sampling_greedy_bf16(logits_, d_sample_ + m, 1, cfg.vocab, 0));
+        }
         return true;
     }
 
