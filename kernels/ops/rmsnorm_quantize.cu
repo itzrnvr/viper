@@ -90,7 +90,7 @@ __global__ void rmsnorm_quantize_kernel(
         for (int off = 16; off > 0; off >>= 1)
             gmax = fmaxf(gmax, __shfl_xor_sync(0xffffffff, gmax, off));
 
-        float scale = gmax / 127.0f;
+        float scale = fmaxf(gmax / 127.0f, 1e-8f);
         if (lid == 0) out_scales[g] = scale;
 
         #pragma unroll

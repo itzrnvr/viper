@@ -49,6 +49,7 @@
 #include "kernels/persistent_forward.h"
 #include "kernels/ops/rmsnorm_quantize.h"
 #include "kernels/ops/dp4a_smem_kernel.h"
+#include "kernels/ops/swiglu_quantize.h"
 
 namespace viper {
 
@@ -457,8 +458,7 @@ private:
                 VK(ops::rmsnorm_quantize_bf16(x_, lw.post_ln, x_norm_, d_q8_, d_q8s_, H, cfg.rms_eps, s_));
                 VK(ops::dp4a_smem_gemv_fused2(lw.gate.packed, lw.gate.scales, lw.up.packed, lw.up.scales,
                                                d_q8_, d_q8s_, g_, u_, 1, lw.gate.out_f, lw.gate.in_f, s_));
-                VK(ops::swiglu_inplace_bf16(g_, u_, I, s_));
-                VK(ops::quantize_to_q8(g_, d_q8_, d_q8s_, 1, I, s_));
+                VK(ops::swiglu_quantize_bf16(g_, u_, g_, d_q8_, d_q8s_, I, s_));
                 VK(ops::dp4a_smem_gemv_residual(lw.down.packed, lw.down.scales, d_q8_, d_q8s_, x_, x_, 1, lw.down.out_f, lw.down.in_f, s_));
                 if (prof && l == 0 && loop == 0) cudaEventRecord(ev[5], s_);
             }
