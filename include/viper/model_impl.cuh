@@ -392,10 +392,10 @@ private:
                                                            lw.up.packed, lw.up.scales,
                                                            lw.post_ln, cfg.rms_eps, x_,
                                                            g_, u_, 1, lw.gate.out_f, lw.gate.in_f, 0));
-                VK(ops::swiglu_inplace_bf16(g_, u_, I, 0));
-                // Fused down_proj + residual: x_ = down_proj(swiglu) + x_.
-                VK(ops::linear_q4_g64_bf16_residual(lw.down.packed, lw.down.scales, g_, x_, x_,
-                                                     1, lw.down.out_f, lw.down.in_f, 0));
+                // Fused swiglu + down_proj + residual: x_ = down_proj(silu(g_)*u_) + x_.
+                VK(ops::linear_q4_g64_bf16_residual_swiglu(lw.down.packed, lw.down.scales,
+                                                            g_, u_, x_, x_,
+                                                            1, lw.down.out_f, lw.down.in_f, 0));
             }
             // Inter-pass + final norm (in-place — no residual connection here).
             VK(ops::rmsnorm_forward_bf16(x_, final_norm_, x_, 1, H, cfg.rms_eps, 0));

@@ -29,7 +29,8 @@ __global__ void linear_q4_g64_warp_kernel(
     const __nv_bfloat16* __restrict__ residual,
     int M, int N, int K,
     const __nv_bfloat16* __restrict__ gamma,  // rmsnorm weights (null = skip)
-    float eps) {
+    float eps,
+    const __nv_bfloat16* __restrict__ swiglu_up) {  // up proj for fused swiglu
 
     const int m = blockIdx.y;
     const int warp_id = threadIdx.x >> 5;
@@ -39,11 +40,18 @@ __global__ void linear_q4_g64_warp_kernel(
         // Still participate in SMEM load + sync to avoid deadlock.
     }
 
-    // --- Cache x in shared memory ---
+    // --- Cache x in shared memory (with optional swiglu fusion) ---
     extern __shared__ __nv_bfloat16 smem_x[];
     const __nv_bfloat16* x_row_global = x + (size_t)m * K;
-    for (int i = threadIdx.x; i < K; i += blockDim.x) { smem_x[i] = x_row_global[i]; }
-    __syncthreads();
+    for (int i = threadIdx.x; i < K; i += blockDim.x) {
+        if (swiglu_up) {
+            float g = __bfloat162float(x_row_global[i]);
+            float u = __bfloat162float(swiglu_up[i]);
+            smem_x[i] = __float2bfloat16(g / (1.0f + __expf(-g)) * u);
+        } else {
+            smem_x[i] = x_row_global[i];
+        }
+    }
 
     // Optional fused rmsnorm: normalize x in SMEM before GEMV.
     if (gamma) {
@@ -153,7 +161,7 @@ cudaError_t linear_q4_g64_bf16(
     dim3 block(256);
     size_t smem_bytes = K * sizeof(__nv_bfloat16);
     linear_q4_g64_warp_kernel<<<grid, block, smem_bytes, stream>>>(
-        w_packed, w_scales, x, y, nullptr, M, N, K, nullptr, 0.0f);
+        w_packed, w_scales, x, y, nullptr, M, N, K, nullptr, 0.0f, nullptr);
     return cudaGetLastError();
 }
 
@@ -175,7 +183,7 @@ cudaError_t linear_q4_g64_bf16_residual(
     dim3 block(256);
     size_t smem_bytes = K * sizeof(__nv_bfloat16);
     linear_q4_g64_warp_kernel<<<grid, block, smem_bytes, stream>>>(
-        w_packed, w_scales, x, y, residual, M, N, K, nullptr, 0.0f);
+        w_packed, w_scales, x, y, residual, M, N, K, nullptr, 0.0f, nullptr);
     return cudaGetLastError();
 }
 
@@ -199,7 +207,26 @@ cudaError_t linear_q4_g64_bf16_rmsnorm(
     dim3 block(256);
     size_t smem_bytes = K * sizeof(__nv_bfloat16);
     linear_q4_g64_warp_kernel<<<grid, block, smem_bytes, stream>>>(
-        w_packed, w_scales, x, y, nullptr, M, N, K, gamma, eps);
+        w_packed, w_scales, x, y, nullptr, M, N, K, gamma, eps, nullptr);
+    return cudaGetLastError();
+}
+
+// Fused swiglu + residual GEMV: reads gate, applies silu(gate)*up, then GEMV + residual.
+cudaError_t linear_q4_g64_bf16_residual_swiglu(
+    const uint8_t* w_packed, const __nv_bfloat16* w_scales,
+    const __nv_bfloat16* gate, const __nv_bfloat16* up,
+    __nv_bfloat16* y, const __nv_bfloat16* residual,
+    int M, int N, int K, cudaStream_t stream) {
+    if (!w_packed || !w_scales || !gate || !up || !y || !residual || M <= 0 || N <= 0 || K <= 0)
+        return cudaErrorInvalidValue;
+    if (K % 64 != 0 || K > SMEM_X_MAX)
+        return cudaErrorInvalidValue;
+    int n_blocks = (N + 7) / 8;
+    dim3 grid(n_blocks, M);
+    dim3 block(256);
+    size_t smem_bytes = K * sizeof(__nv_bfloat16);
+    linear_q4_g64_warp_kernel<<<grid, block, smem_bytes, stream>>>(
+        w_packed, w_scales, gate, y, residual, M, N, K, nullptr, 0.0f, up);
     return cudaGetLastError();
 }
 

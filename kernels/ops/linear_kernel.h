@@ -98,6 +98,13 @@ cudaError_t linear_q4_g64_bf16_fused2_rmsnorm(
     const __nv_bfloat16* x,
     __nv_bfloat16* y0, __nv_bfloat16* y1,
     int M, int N, int K, cudaStream_t stream);
+
+// Fused swiglu + residual GEMV: silu(gate)*up as input, then GEMV + residual.
+cudaError_t linear_q4_g64_bf16_residual_swiglu(
+    const uint8_t* w_packed, const __nv_bfloat16* w_scales,
+    const __nv_bfloat16* gate, const __nv_bfloat16* up,
+    __nv_bfloat16* y, const __nv_bfloat16* residual,
+    int M, int N, int K, cudaStream_t stream);
 }  // namespace ops
 }  // namespace viper
 
