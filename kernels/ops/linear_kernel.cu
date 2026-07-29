@@ -103,6 +103,9 @@ __global__ void linear_q4_g64_warp_kernel(
     }
 }
 
+// SMEM carveout experiment: reverted — reducing L1 hurts more than SMEM helps.
+
+
 cudaError_t linear_q4_g64_bf16(
     const uint8_t* w_packed,
     const __nv_bfloat16* w_scales,
