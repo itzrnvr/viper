@@ -82,6 +82,22 @@ cudaError_t linear_q4_g64_bf16_fused2(
     int M, int N, int K,
     cudaStream_t stream);
 
+
+// Fused rmsnorm + Q4 GEMV: normalizes x in SMEM, then does matmul.
+cudaError_t linear_q4_g64_bf16_rmsnorm(
+    const uint8_t* w_packed, const __nv_bfloat16* w_scales,
+    const __nv_bfloat16* gamma, float eps,
+    const __nv_bfloat16* x, __nv_bfloat16* y,
+    int M, int N, int K, cudaStream_t stream);
+
+// Fused rmsnorm + 2-matrix GEMV.
+cudaError_t linear_q4_g64_bf16_fused2_rmsnorm(
+    const uint8_t* w0, const __nv_bfloat16* s0,
+    const uint8_t* w1, const __nv_bfloat16* s1,
+    const __nv_bfloat16* gamma, float eps,
+    const __nv_bfloat16* x,
+    __nv_bfloat16* y0, __nv_bfloat16* y1,
+    int M, int N, int K, cudaStream_t stream);
 }  // namespace ops
 }  // namespace viper
 

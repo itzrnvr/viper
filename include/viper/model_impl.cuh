@@ -316,10 +316,11 @@ private:
 
                 // --- Attention sublayer ---
                 // Out-of-place rmsnorm: x_ preserved as residual for o_proj.
-                VK(ops::rmsnorm_forward_bf16(x_, lw.input_ln, x_norm_, 1, H, cfg.rms_eps, 0));
-                VK(ops::linear_q4_g64_bf16(lw.q.packed, lw.q.scales, x_norm_, q_, 1, lw.q.out_f, lw.q.in_f, 0));
-                VK(ops::linear_q4_g64_bf16_fused2(lw.k.packed, lw.k.scales, lw.v.packed, lw.v.scales,
-                                                   x_norm_, kb_, vb_, 1, lw.k.out_f, lw.k.in_f, 0));
+                VK(ops::linear_q4_g64_bf16_rmsnorm(lw.q.packed, lw.q.scales, lw.input_ln,
+                                                    cfg.rms_eps, x_, q_, 1, lw.q.out_f, lw.q.in_f, 0));
+                VK(ops::linear_q4_g64_bf16_fused2_rmsnorm(lw.k.packed, lw.k.scales, lw.v.packed, lw.v.scales,
+                                                           lw.input_ln, cfg.rms_eps, x_,
+                                                           kb_, vb_, 1, lw.k.out_f, lw.k.in_f, 0));
                 VK(ops::rope_apply_inplace_bf16(q_, kb_, cos_pos, sin_pos, 1, nQ, nKVh, 1, HD, 0));
 
                 // KV append.
@@ -338,9 +339,10 @@ private:
 
                 // --- MLP sublayer ---
                 // Out-of-place rmsnorm: x_ preserved as residual for down_proj.
-                VK(ops::rmsnorm_forward_bf16(x_, lw.post_ln, x_norm_, 1, H, cfg.rms_eps, 0));
-                VK(ops::linear_q4_g64_bf16_fused2(lw.gate.packed, lw.gate.scales, lw.up.packed, lw.up.scales,
-                                                   x_norm_, g_, u_, 1, lw.gate.out_f, lw.gate.in_f, 0));
+                VK(ops::linear_q4_g64_bf16_fused2_rmsnorm(lw.gate.packed, lw.gate.scales,
+                                                           lw.up.packed, lw.up.scales,
+                                                           lw.post_ln, cfg.rms_eps, x_,
+                                                           g_, u_, 1, lw.gate.out_f, lw.gate.in_f, 0));
                 VK(ops::swiglu_inplace_bf16(g_, u_, I, 0));
                 // Fused down_proj + residual: x_ = down_proj(swiglu) + x_.
                 VK(ops::linear_q4_g64_bf16_residual(lw.down.packed, lw.down.scales, g_, x_, x_,
