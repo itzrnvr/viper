@@ -101,11 +101,19 @@ int main(int argc, char** argv) {
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // Prefill.
+    // Batch prefill: process prompt in chunks for near-instant TTFT.
     int32_t next = -1;
-    for (size_t i = 0; i < ids.size(); ++i) {
-        bool last = (i + 1 == ids.size());
-        if (!engine.forward(ids[i], last, &next)) return 1;
+    for (size_t i = 0; i < ids.size(); i += engine.max_batch) {
+        int M = std::min((int)(ids.size() - i), engine.max_batch);
+        if (M <= 1) {
+            bool last = (i + M == ids.size());
+            if (!engine.forward(ids[i], last, &next)) return 1;
+        } else {
+            int32_t batch[16], predicted[16];
+            for (int j = 0; j < M; ++j) batch[j] = ids[i + j];
+            if (!engine.forward_batch(batch, M, predicted)) return 1;
+            next = predicted[M - 1];
+        }
     }
     auto t1 = std::chrono::steady_clock::now();
     double ttft = std::chrono::duration<double>(t1 - t0).count();

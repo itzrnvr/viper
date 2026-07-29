@@ -313,28 +313,27 @@ public:
                 const int nQD = nQ * HD, nKVD = nKVh * HD;
 
                 // --- Attention sublayer (batch) ---
-                VK(ops::rmsnorm_forward_bf16(x_, lw.input_ln, x_norm_, M, H, cfg.rms_eps, 0));
-                VK(ops::linear_q4_g64_bf16(lw.q.packed, lw.q.scales, x_norm_, q_,
-                                           M, lw.q.out_f, lw.q.in_f, 0));
-                VK(ops::linear_q4_g64_bf16_fused2(lw.k.packed, lw.k.scales, lw.v.packed, lw.v.scales,
-                                                   x_norm_, kb_, vb_, M, lw.k.out_f, lw.k.in_f, 0));
+                const int slot = loop * cfg.n_layers + l;
+                __nv_bfloat16* v_cache_ptr = kv_v_[slot] + (size_t)pos * nKVh * HD;
+                VK(ops::linear_q4_g64_bf16_rmsnorm(lw.q.packed, lw.q.scales, lw.input_ln,
+                                                    cfg.rms_eps, x_, q_, M, lw.q.out_f, lw.q.in_f, 0));
+                VK(ops::linear_q4_g64_bf16_fused2_rmsnorm(lw.k.packed, lw.k.scales, lw.v.packed, lw.v.scales,
+                                                           lw.input_ln, cfg.rms_eps, x_,
+                                                           kb_, v_cache_ptr, M, lw.k.out_f, lw.k.in_f, 0));
                 VK(ops::rope_apply_inplace_bf16(q_, kb_, cos_pos, sin_pos,
                                                  1, nQ, nKVh, M, HD, 0));
-
-                // Batch KV append + batch attention with causal masking.
-                const int slot = loop * cfg.n_layers + l;
-                VK(ops::kv_append_batch_bf16(kb_, vb_, kv_k_[slot], kv_v_[slot],
-                                             M, nKVh, HD, pos, 0));
+                // KV append (k only — v was written directly to cache).
+                VK(cudaMemcpyAsync(kv_k_[slot] + (size_t)pos * nKVh * HD, kb_,
+                                   (size_t)M * nKVh * HD * 2, cudaMemcpyDeviceToDevice, 0));
                 VK(ops::attn_batch_bf16(q_, kv_k_[slot], kv_v_[slot], attn_,
                                          M, nQ, nKVh, HD, pos, attn_scale, 0));
-                // Fused o_proj + residual.
                 VK(ops::linear_q4_g64_bf16_residual(lw.o.packed, lw.o.scales, attn_, x_, x_,
                                                      M, lw.o.out_f, lw.o.in_f, 0));
-
                 // --- MLP sublayer (batch) ---
-                VK(ops::rmsnorm_forward_bf16(x_, lw.post_ln, x_norm_, M, H, cfg.rms_eps, 0));
-                VK(ops::linear_q4_g64_bf16_fused2(lw.gate.packed, lw.gate.scales, lw.up.packed, lw.up.scales,
-                                                   x_norm_, g_, u_, M, lw.gate.out_f, lw.gate.in_f, 0));
+                VK(ops::linear_q4_g64_bf16_fused2_rmsnorm(lw.gate.packed, lw.gate.scales,
+                                                           lw.up.packed, lw.up.scales,
+                                                           lw.post_ln, cfg.rms_eps, x_,
+                                                           g_, u_, M, lw.gate.out_f, lw.gate.in_f, 0));
                 VK(ops::swiglu_inplace_bf16(g_, u_, M * I, 0));
                 VK(ops::linear_q4_g64_bf16_residual(lw.down.packed, lw.down.scales, g_, x_, x_,
                                                      M, lw.down.out_f, lw.down.in_f, 0));
