@@ -57,12 +57,16 @@ namespace viper {
     std::fprintf(stderr, "[viper] cuda error %s at %s:%d\n", \
         cudaGetErrorString(e_), __FILE__, __LINE__); return false; } } while (0)
 
+enum KVCacheType { KV_BF16 = 0, KV_Q8 = 1, KV_Q6 = 2, KV_Q4 = 3, KV_TURBO = 4 };
+
 struct ModelConfig {
     int n_layers = 22, n_passes = 2, hidden = 3072, intermediate = 10752;
     int n_heads = 48, n_kv_heads = 8, head_dim = 128, vocab = 166144;
     int max_seq = 262144;
     float rms_eps = 1e-5f;
     float rope_theta = 70000000.0f;
+    int kv_cache_type = KV_BF16;  // 0=BF16, 1=Q8, 2=Q6, 3=Q4, 4=TurboQuant
+    int lm_prune = 0;  // 0=full vocab, >0=only compute first N logits (lossy)
 };
 
 struct GpuLinearQ4 {
@@ -408,9 +412,10 @@ public:
 
         seq_len_ += M;
         // Multi-M lm_head: all M tokens in one GEMV call (shares weight reads).
+        int eff_vocab = (cfg.lm_prune > 0) ? cfg.lm_prune : cfg.vocab;
         VK(ops::linear_q4_multim(lm_head_q4_.packed, lm_head_q4_.scales,
-                                  x_, logits_, M, cfg.vocab, H, 0));
-        VK(ops::sampling_greedy_bf16(logits_, d_sample_, M, cfg.vocab, 0));
+                                  x_, logits_, M, eff_vocab, H, 0));
+        VK(ops::sampling_greedy_bf16(logits_, d_sample_, M, eff_vocab, 0));
         VK(cudaMemcpy(out_tokens, d_sample_, M * sizeof(int32_t), cudaMemcpyDeviceToHost));
         return true;
     }
@@ -467,9 +472,9 @@ private:
 
         ++seq_len_;
         if (want_logits) {
-            if (prof) cudaEventRecord(ev[6], s_);
-            VK(ops::linear_q4_g64_bf16(lm_head_q4_.packed, lm_head_q4_.scales, x_, logits_, 1, cfg.vocab, H, s_));
-            VK(ops::sampling_greedy_bf16(logits_, d_sample_, 1, cfg.vocab, s_));
+            int eff_vocab = (cfg.lm_prune > 0) ? cfg.lm_prune : cfg.vocab;
+            VK(ops::linear_q4_g64_bf16(lm_head_q4_.packed, lm_head_q4_.scales, x_, logits_, 1, eff_vocab, H, s_));
+            VK(ops::sampling_greedy_bf16(logits_, d_sample_, 1, eff_vocab, s_));
             VK(cudaMemcpy(out_token, d_sample_, 4, cudaMemcpyDeviceToHost));
             if (prof) {
                 cudaEventRecord(ev[7], s_);

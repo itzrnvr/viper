@@ -72,6 +72,8 @@ int main(int argc, char** argv) {
     int fastMode  = std::atoi(argval(argc, argv, "--fast", "0").c_str());
     int usePersistent = std::atoi(argval(argc, argv, "--persistent", "0").c_str());
     int useGraph = std::atoi(argval(argc, argv, "--graph", "0").c_str());
+    int lmPrune = std::atoi(argval(argc, argv, "--lm-head-prune", "0").c_str());
+    int cacheType = std::atoi(argval(argc, argv, "--cache-type", "0").c_str());  // 0=bf16 1=q8 2=q6 3=q4
     if (usePersistent > 0 || useGraph > 0) spec_k = 0;  // graph/persistent: single-token decode
 
     viper::Tokenizer tok;
@@ -84,6 +86,14 @@ int main(int argc, char** argv) {
     if (fastMode > 0) {
         engine.cfg.n_passes = 1;  // loop-0 only: halves weight reads
         std::printf("[cli] FAST MODE: n_passes=1 (22 layers, ~2x speed)\n");
+    }
+    if (lmPrune > 0) {
+        engine.cfg.lm_prune = lmPrune;
+        std::fprintf(stderr, "[cli] WARNING: lm_head pruning = %d (LOSSY: greedy output may differ)\n", lmPrune);
+    }
+    if (cacheType > 0) {
+        std::fprintf(stderr, "[cli] ERROR: cache type %d not yet wired (Q8 allocation pending)\n", cacheType);
+        return 1;
     }
 
     // Load EAGLE drafter if specified.
@@ -112,22 +122,17 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
 
     // Prefill: batch mode (fast) or sequential (exact).
-    int prefill_batch = std::atoi(argval(argc, argv, "--prefill-batch", "0").c_str());
+    int prefill_batch = std::atoi(argval(argc, argv, "--prefill-batch", "8").c_str());
     int32_t next = -1;
 
     if (prefill_batch > 0 && ids.size() > 1) {
-        // Batch prefill: process prompt in chunks of max_batch.
-        // Uses forward_batch which reads weights once per chunk (multi-M).
-        int32_t predicted[9];
+        // Batch prefill: process prompt in chunks (weight reads shared across M tokens).
+        int32_t predicted[17];
         size_t i = 0;
         while (i < ids.size()) {
             int M = std::min((int)(ids.size() - i), engine.max_batch);
-            if (M == (int)(ids.size() - i) && M <= 2) {
-                // Last 1-2 tokens: use sequential for exact final prediction.
-                for (int j = 0; j < M; ++j) {
-                    bool last = (i + j + 1 == ids.size());
-                    if (!engine.forward(ids[i + j], last, &next)) return 1;
-                }
+            if (M < 2) {
+                if (!engine.forward(ids[i], true, &next)) return 1;
             } else {
                 if (!engine.forward_batch(ids.data() + i, M, predicted)) return 1;
                 next = predicted[M - 1];
@@ -135,7 +140,6 @@ int main(int argc, char** argv) {
             i += M;
         }
     } else {
-        // Sequential prefill (exact output quality).
         for (size_t i = 0; i < ids.size(); ++i) {
             bool last = (i + 1 == ids.size());
             if (!engine.forward(ids[i], last, &next)) return 1;
