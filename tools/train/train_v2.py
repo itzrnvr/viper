@@ -78,6 +78,8 @@ with torch.no_grad():
             next_hidden_list.append(h[t+1].cpu())
             token_list.append(inputs.input_ids[0, t+1].cpu())
             next_token_list.append(inputs.input_ids[0, t+2].cpu())
+        if len(hidden_list) % 500 == 0: torch.cuda.empty_cache()
+        del out, h
 
 hidden = torch.stack(hidden_list)
 next_hidden = torch.stack(next_hidden_list)
@@ -88,8 +90,12 @@ print(f"Collected {N} samples")
 
 # Create drafter
 print("Creating drafter...")
-drafter = type(model.model.layers[0])(model.config, layer_idx=0).to(torch.bfloat16).cuda()
-drafter.load_state_dict(model.model.layers[0].state_dict())
+try:
+    drafter = type(model.model.layers[0])(model.config, layer_idx=0).to(torch.bfloat16).cuda()
+    drafter.load_state_dict(model.model.layers[0].state_dict())
+except Exception as e:
+    print(f"Layer constructor failed ({e}), using deepcopy...")
+    drafter = copy.deepcopy(model.model.layers[0])
 drafter_norm = copy.deepcopy(model.model.norm)
 embed = model.model.embed_tokens
 lm_head = model.lm_head
