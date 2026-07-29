@@ -77,9 +77,9 @@ __global__ void linear_q4_dp4a_multim_kernel(
     const uint8_t* w_row = w_packed + (size_t)n * (K / 2);
     const __nv_bfloat16* s_row = w_scales + (size_t)n * (K / 64);
 
-    float acc[8];
+    float acc[16];
     #pragma unroll
-    for (int m = 0; m < 8; ++m) acc[m] = 0.0f;
+    for (int m = 0; m < 16; ++m) acc[m] = 0.0f;
 
     const int n_bytes = K / 2;
     const int vec_end = n_bytes - (n_bytes % 128);
@@ -103,7 +103,7 @@ __global__ void linear_q4_dp4a_multim_kernel(
         int w_packed_1 = (w4 & 0xFF) | ((w5 & 0xFF) << 8) | ((w6 & 0xFF) << 16) | ((w7 & 0xFF) << 24);
 
         #pragma unroll
-        for (int m = 0; m < 8; ++m) {
+        for (int m = 0; m < 16; ++m) {
             if (m >= M) break;
             int a0 = *reinterpret_cast<const int*>(xq + m * K + xk);
             int a1 = *reinterpret_cast<const int*>(xq + m * K + xk + 4);
@@ -115,7 +115,7 @@ __global__ void linear_q4_dp4a_multim_kernel(
 
     // Warp reduce per token
     #pragma unroll
-    for (int m = 0; m < 8; ++m) {
+    for (int m = 0; m < 16; ++m) {
         if (m >= M) break;
         float a = acc[m];
         #pragma unroll
@@ -149,7 +149,7 @@ cudaError_t linear_q4_multim(
     const uint8_t* w, const __nv_bfloat16* s,
     const __nv_bfloat16* x, __nv_bfloat16* y,
     int M, int N, int K, cudaStream_t stream) {
-    if (!w || !s || !x || !y || M <= 0 || N <= 0 || K <= 0 || M > 8)
+    if (!w || !s || !x || !y || M <= 0 || N <= 0 || K <= 0 || M > 16)
         return cudaErrorInvalidValue;
     if (!ensure_xq(M, K)) return cudaErrorMemoryAllocation;
 
@@ -167,7 +167,7 @@ cudaError_t linear_q4_multim_residual(
     const __nv_bfloat16* x, __nv_bfloat16* y,
     const __nv_bfloat16* residual,
     int M, int N, int K, cudaStream_t stream) {
-    if (!w || !s || !x || !y || !residual || M <= 0 || N <= 0 || K <= 0 || M > 8)
+    if (!w || !s || !x || !y || !residual || M <= 0 || N <= 0 || K <= 0 || M > 16)
         return cudaErrorInvalidValue;
     if (!ensure_xq(M, K)) return cudaErrorMemoryAllocation;
 

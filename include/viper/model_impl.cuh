@@ -78,7 +78,7 @@ class NanbeigeEngine {
 public:
     ModelConfig cfg;
     int kv_max_seq = 2048;
-    int max_batch = 5;
+    int max_batch = 16;
     bool load(const std::string& path) {
 #ifdef _WIN32
         HANDLE hf = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
@@ -218,7 +218,7 @@ public:
         pool_sz += MB * nQ * 2 + 255;      // attn_
         pool_sz += MB * I * 2 + 255;       // g_
         pool_sz += MB * I * 2 + 255;       // u_
-        pool_sz += cfg.vocab * 2 + 255;    // logits_ (M=1)
+        pool_sz += MB * cfg.vocab * 2 + 255;    // logits_ (multi-M)
         pool_sz += MB * 4 + 255;           // d_sample_
         pool_sz += MB * 4 + 255;           // d_id_
         void* pool = nullptr;
@@ -236,7 +236,7 @@ public:
         carve((void**)&attn_, (size_t)MB * nQ * 2);
         carve((void**)&g_, (size_t)MB * I * 2);
         carve((void**)&u_, (size_t)MB * I * 2);
-        carve((void**)&logits_, (size_t)cfg.vocab * 2);
+        carve((void**)&logits_, (size_t)MB * cfg.vocab * 2);
         carve((void**)&d_sample_, (size_t)MB * 4);
         carve((void**)&d_id_, (size_t)MB * 4);
         // RoPE tables (separate allocation — large, accessed by all layers).
@@ -404,12 +404,10 @@ public:
         }
 
         seq_len_ += M;
-        // Sequential lm_head + sampling: keeps logits_ at M=1 size (no bloat).
-        for (int m = 0; m < M; ++m) {
-            VK(ops::linear_q4_g64_bf16(lm_head_q4_.packed, lm_head_q4_.scales,
-                                       x_ + (size_t)m * H, logits_, 1, cfg.vocab, H, 0));
-            VK(ops::sampling_greedy_bf16(logits_, d_sample_ + m, 1, cfg.vocab, 0));
-        }
+        // Multi-M lm_head: all M tokens in one GEMV call (shares weight reads).
+        VK(ops::linear_q4_multim(lm_head_q4_.packed, lm_head_q4_.scales,
+                                  x_, logits_, M, cfg.vocab, H, 0));
+        VK(ops::sampling_greedy_bf16(logits_, d_sample_, M, cfg.vocab, 0));
         VK(cudaMemcpy(out_tokens, d_sample_, M * sizeof(int32_t), cudaMemcpyDeviceToHost));
         return true;
     }

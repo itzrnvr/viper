@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
     double ttft = std::chrono::duration<double>(t1 - t0).count();
 
     // N-gram speculative decoding.
-    constexpr int MAX_K = 8;
+    constexpr int MAX_K = 16;
     int K = std::min(spec_k, MAX_K);
     int32_t drafts[MAX_K];
 
