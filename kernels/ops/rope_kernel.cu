@@ -182,9 +182,10 @@ __global__ void rope_k_to_cache_kernel(
 // Fused Q-rope + K-to-cache in a single kernel launch.
 // Grid: (nQ + nKVh) blocks, 128 threads. Q blocks use first 32 threads.
 // Fused Q-rope + K-to-cache in a single kernel launch.
-// Uses SMEM exchange for Q to avoid in-place write race conditions.
+// ZERO __syncthreads: Q writes to separate output buffer (no in-place race).
 __global__ void rope_q_k_fused_kernel(
-    __nv_bfloat16* __restrict__ Q,
+    const __nv_bfloat16* __restrict__ Q_in,
+    __nv_bfloat16* __restrict__ Q_out,
     const __nv_bfloat16* __restrict__ K_src,
     __nv_bfloat16* __restrict__ K_cache,
     int pos, int nKV, int nQ,
@@ -195,19 +196,15 @@ __global__ void rope_q_k_fused_kernel(
     const int bid = blockIdx.x;
     const int tid = threadIdx.x;
 
-    __shared__ float sx[128];
-
     if (bid < nQ) {
-        // Q rope in-place: pre-load to SMEM to avoid write race
+        // Q rope: read from Q_in, write to Q_out (no race, no sync)
         const int h = bid;
-        sx[tid] = __bfloat162float(Q[h * D + tid]);
-        __syncthreads();
         const int partner = (tid < half) ? (tid + half) : (tid - half);
-        float xv = sx[tid];
-        float pv = sx[partner];
+        float xv = __bfloat162float(Q_in[h * D + tid]);
+        float pv = __bfloat162float(Q_in[h * D + partner]);
         float c = cos_t[tid], s = sin_t[tid];
         float rot = (tid < half) ? -pv : pv;
-        Q[h * D + tid] = __float2bfloat16(xv * c + rot * s);
+        Q_out[h * D + tid] = __float2bfloat16(xv * c + rot * s);
     } else {
         // K rope + write to cache (source is read-only, no race)
         if (tid >= D) return;
@@ -235,6 +232,19 @@ cudaError_t rope_apply_q_inplace_k_to_cache(
         Q, cos_t, sin_t, 1, nQ, T);
     rope_k_to_cache_kernel<<<nKVh, 128, 0, stream>>>(
         K_src, K_cache, pos, nKV, cos_t, sin_t, D);
+    return cudaGetLastError();
+}
+
+// Fused rope: Q to separate output + K to cache. ZERO __syncthreads.
+cudaError_t rope_q_k_fused(
+    const __nv_bfloat16* Q_in, __nv_bfloat16* Q_out,
+    const __nv_bfloat16* K_src, __nv_bfloat16* K_cache,
+    int pos, int nKV, int nQ, int nKVh,
+    const float* cos_t, const float* sin_t,
+    int D, cudaStream_t stream) {
+    if (D != 128) return cudaErrorInvalidValue;
+    rope_q_k_fused_kernel<<<nQ + nKVh, 128, 0, stream>>>(
+        Q_in, Q_out, K_src, K_cache, pos, nKV, nQ, cos_t, sin_t);
     return cudaGetLastError();
 }
 

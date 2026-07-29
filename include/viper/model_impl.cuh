@@ -444,11 +444,12 @@ private:
                                                    x_norm_, kb_, v_cache_ptr, 1, lw.k.out_f, lw.k.in_f, s_));
                 if (prof && l == 0 && loop == 0) cudaEventRecord(ev[2], s_);
                 // Fused rope + K-to-cache: eliminates separate k memcpy.
-                VK(ops::rope_apply_q_inplace_k_to_cache(
-                    q_, kb_, kv_k_[slot], pos, nKVh, cos_pos, sin_pos,
-                    nQ, nKVh, 1, HD, s_));
+                // Fused rope (ZERO __syncthreads): Q→vb_, K→cache in 1 launch
+                VK(ops::rope_q_k_fused(
+                    q_, vb_, kb_, kv_k_[slot], pos, nKVh, nQ, nKVh,
+                    cos_pos, sin_pos, HD, s_));
 
-                VK(ops::attn_decode_bf16(q_, kv_k_[slot], kv_v_[slot], attn_,
+                VK(ops::attn_decode_bf16(vb_, kv_k_[slot], kv_v_[slot], attn_,
                                          nQ, nKVh, HD, pos + 1, attn_scale, s_));
                 if (prof && l == 0 && loop == 0) cudaEventRecord(ev[3], s_);
                 // Fused o_proj + residual: x_ = o_proj(attn) + x_.

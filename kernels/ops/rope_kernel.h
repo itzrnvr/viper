@@ -89,6 +89,14 @@ cudaError_t rope_apply_q_inplace_k_to_cache(
     const float* cos_t, const float* sin_t,
     int nQ, int nKVh, int T, int D,
     cudaStream_t stream);
+
+// Fused rope: Q → separate output + K → cache. ZERO __syncthreads.
+cudaError_t rope_q_k_fused(
+    const __nv_bfloat16* Q_in, __nv_bfloat16* Q_out,
+    const __nv_bfloat16* K_src, __nv_bfloat16* K_cache,
+    int pos, int nKV, int nQ, int nKVh,
+    const float* cos_t, const float* sin_t,
+    int D, cudaStream_t stream);
 }  // namespace ops
 }  // namespace viper
 
