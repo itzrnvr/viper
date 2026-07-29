@@ -285,7 +285,7 @@ public:
             cos_pos, sin_pos,
             H, I, nQ, nKVh, HD, cfg.vocab, pos,
             token, cfg.rms_eps, attn_scale,
-            d_sample_, 48, 0));  // persistent kernel (experimental, 48 blocks safe)
+            d_sample_, 288, 0));
         VK(cudaMemcpy(out_token, d_sample_, 4, cudaMemcpyDeviceToHost));
         return true;
     }

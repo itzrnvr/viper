@@ -256,7 +256,7 @@ struct DLayer {
 
 // ---- Main persistent decode kernel ----
 // ONE launch for the entire forward pass. Replaces ~400 kernel launches.
-__global__ __launch_bounds__(256, 4) void persistent_decode_kernel(
+__global__ __launch_bounds__(256, 6) void persistent_decode_kernel(
     const DLayer* __restrict__ layers,
     int n_layers, int n_loops,
     const __nv_bfloat16* __restrict__ embed,
@@ -399,6 +399,20 @@ cudaError_t launch_persistent_decode(
     int32_t token, float eps, float attn_scale,
     int32_t* out_token,
     int grid_size, cudaStream_t stream) {
+    // Query actual max active blocks to avoid deadlock.
+    int max_per_sm = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_per_sm,
+        persistent_decode_kernel, 256, 0);
+    int device_id = 0;
+    cudaDeviceProp prop;
+    cudaGetDevice(&device_id);
+    cudaGetDeviceProperties(&prop, device_id);
+    int max_grid = max_per_sm * prop.multiProcessorCount;
+    if (grid_size > max_grid) {
+        fprintf(stderr, "[persistent] grid %d > max %d (blocks/SM=%d, SMs=%d), clamping\n",
+                grid_size, max_grid, max_per_sm, prop.multiProcessorCount);
+        grid_size = max_grid;
+    }
     void* args[] = {
         (void*)&d_layers, &n_layers, &n_loops, &embed,
         &lm_packed, &lm_scales, &final_norm,
