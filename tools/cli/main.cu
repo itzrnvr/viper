@@ -178,7 +178,7 @@ int main(int argc, char** argv) {
         ++n_gen;
 
         int32_t prev = next;
-        if (!engine.forward_persistent(next, &next)) return 1;
+        if (!engine.forward(next, true, &next)) return 1;
         history.push_back(prev);
         int h = history.size();
         if (h >= 3)
