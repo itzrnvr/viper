@@ -70,8 +70,7 @@ class NanbeigeEngine {
 public:
     ModelConfig cfg;
     int kv_max_seq = 4096;
-    int max_batch = 1;  // set to K+1 for spec decode
-
+    int max_batch = 1;
     bool load(const std::string& path) {
         HANDLE hf = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
