@@ -94,8 +94,8 @@ __global__ void rope_apply_q_or_k_kernel(
         const int partner = (pos < half) ? (pos + half) : (pos - half);
         const int partner_iter = partner / 32;
         const int partner_tid = partner % 32;
-        const int x_idx = ((b * H + h) * T + t) * HEAD_DIM + pos;
-        const int partner_x_idx = ((b * H + h) * T + t) * HEAD_DIM + partner;
+        const int x_idx = ((b * T + t) * H + h) * HEAD_DIM + pos;
+        const int partner_x_idx = ((b * T + t) * H + h) * HEAD_DIM + partner;
 
         const float x_val = __bfloat162float(x[x_idx]);
         // Read partner value from the partner thread's iteration
