@@ -35,7 +35,7 @@ __global__ void linear_q4_g64_warp_kernel(
     const int m = blockIdx.y;
     const int warp_id = threadIdx.x >> 5;
     const int lane_id = threadIdx.x & 31;
-    const int n = blockIdx.x * 8 + warp_id;
+    const int n = blockIdx.x * (blockDim.x >> 5) + warp_id;
     if (n >= N || m >= M) {
         // Still participate in SMEM load + sync to avoid deadlock.
     }
@@ -247,7 +247,7 @@ __global__ void linear_q4_g64_fused2_kernel(
     const int m = blockIdx.y;
     const int warp_id = threadIdx.x >> 5;
     const int lane_id = threadIdx.x & 31;
-    const int n = blockIdx.x * 8 + warp_id;
+    const int n = blockIdx.x * (blockDim.x >> 5) + warp_id;
     if (n >= N) {
         // participate in SMEM load to avoid deadlock
     }
