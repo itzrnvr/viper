@@ -27,8 +27,9 @@ static std::string argval(int argc, char** argv, const char* key, const char* df
 // ---- N-gram cache for speculative drafting ----
 // Maps a window of N tokens → the token that followed. Used to draft
 // candidate continuations without running the model.
+// N-gram speculative decode cache. N=2 for higher hit rate on creative text.
 struct NgramCache {
-    static constexpr int N = 3;
+    static constexpr int N = 2;
     static constexpr int SIZE = 1 << 16;
     static constexpr int MASK = SIZE - 1;
 
@@ -37,45 +38,42 @@ struct NgramCache {
 
     NgramCache() : table(SIZE, {0, -1}) {}
 
-    static uint32_t hash3(int32_t a, int32_t b, int32_t c) {
+    static uint32_t hash2(int32_t a, int32_t b) {
         uint32_t h = 2166136261u;
         h ^= (uint32_t)a; h *= 16777619u;
         h ^= (uint32_t)b; h *= 16777619u;
-        h ^= (uint32_t)c; h *= 16777619u;
         return h;
     }
 
-    void add(int32_t a, int32_t b, int32_t c, int32_t next) {
-        uint32_t h = hash3(a, b, c) & MASK;
-        table[h] = {h + 1, next};  // store hash+1 so 0 means empty
+    void add(int32_t a, int32_t b, int32_t next) {
+        uint32_t h = hash2(a, b) & MASK;
+        table[h] = {h + 1, next};
     }
 
-    int32_t lookup(int32_t a, int32_t b, int32_t c) const {
-        uint32_t h = hash3(a, b, c) & MASK;
+    int32_t lookup(int32_t a, int32_t b) const {
+        uint32_t h = hash2(a, b) & MASK;
         const Entry& e = table[h];
         if (e.hash == h + 1) return e.value;
         return -1;
     }
 
-    // Chain-draft up to max_k tokens from history.
     int draft(const std::vector<int32_t>& hist, int32_t* out, int max_k) const {
         int n = hist.size();
         if (n < N) return 0;
-        int32_t a = hist[n - 3], b = hist[n - 2], c = hist[n - 1];
+        int32_t a = hist[n - 2], b = hist[n - 1];
         int k = 0;
         while (k < max_k) {
-            int32_t next = lookup(a, b, c);
+            int32_t next = lookup(a, b);
             if (next < 0) break;
             out[k++] = next;
-            a = b; b = c; c = next;
+            a = b; b = next;
         }
         return k;
     }
 
-    // Record all n-grams from a token sequence into the cache.
     void ingest(const std::vector<int32_t>& tokens) {
         for (int i = 0; i + N < (int)tokens.size(); ++i)
-            add(tokens[i], tokens[i+1], tokens[i+2], tokens[i+3]);
+            add(tokens[i], tokens[i+1], tokens[i+2]);
     }
 };
 
@@ -101,19 +99,11 @@ int main(int argc, char** argv) {
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // Batch prefill: process prompt in chunks for near-instant TTFT.
+    // Prefill (sequential for output quality).
     int32_t next = -1;
-    for (size_t i = 0; i < ids.size(); i += engine.max_batch) {
-        int M = std::min((int)(ids.size() - i), engine.max_batch);
-        if (M <= 1) {
-            bool last = (i + M == ids.size());
-            if (!engine.forward(ids[i], last, &next)) return 1;
-        } else {
-            int32_t batch[16], predicted[16];
-            for (int j = 0; j < M; ++j) batch[j] = ids[i + j];
-            if (!engine.forward_batch(batch, M, predicted)) return 1;
-            next = predicted[M - 1];
-        }
+    for (size_t i = 0; i < ids.size(); ++i) {
+        bool last = (i + 1 == ids.size());
+        if (!engine.forward(ids[i], last, &next)) return 1;
     }
     auto t1 = std::chrono::steady_clock::now();
     double ttft = std::chrono::duration<double>(t1 - t0).count();
@@ -170,8 +160,8 @@ int main(int argc, char** argv) {
 
                     // Update n-gram cache.
                     int h = history.size();
-                    if (h >= 4) {
-                        ngram.add(history[h-4], history[h-3], history[h-2], t);
+                    if (h >= 3) {
+                        ngram.add(history[h-3], history[h-2], t);
                     }
                 }
 
@@ -191,8 +181,8 @@ int main(int argc, char** argv) {
         if (!engine.forward(next, true, &next)) return 1;
         history.push_back(prev);
         int h = history.size();
-        if (h >= 4)
-            ngram.add(history[h-4], history[h-3], history[h-2], prev);
+        if (h >= 3)
+            ngram.add(history[h-3], history[h-2], prev);
     }
 
 done:
