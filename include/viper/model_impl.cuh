@@ -19,7 +19,14 @@
 // Safety: VRAM headroom check before weight upload; all CUDA calls checked.
 #pragma once
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cmath>
@@ -72,6 +79,7 @@ public:
     int kv_max_seq = 2048;
     int max_batch = 5;
     bool load(const std::string& path) {
+#ifdef _WIN32
         HANDLE hf = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hf == INVALID_HANDLE_VALUE) {
@@ -82,8 +90,18 @@ public:
         HANDLE hm = CreateFileMappingA(hf, nullptr, PAGE_READONLY, 0, 0, nullptr);
         if (!hm) { CloseHandle(hf); return false; }
         const uint8_t* view = (const uint8_t*)MapViewOfFile(hm, FILE_MAP_READ, 0, 0, 0);
-        CloseHandle(hm);
-        CloseHandle(hf);
+        CloseHandle(hm); CloseHandle(hf);
+#else
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            std::fprintf(stderr, "[viper] cannot open %s\n", path.c_str()); return false;
+        }
+        struct stat st;
+        if (fstat(fd, &st) < 0) { close(fd); return false; }
+        const size_t fsz = (size_t)st.st_size;
+        const uint8_t* view = (const uint8_t*)mmap(nullptr, fsz, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+#endif
         if (!view) { std::fprintf(stderr, "[viper] mmap failed\n"); return false; }
         map_view_ = (void*)view;
 

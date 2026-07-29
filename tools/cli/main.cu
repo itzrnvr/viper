@@ -54,11 +54,35 @@ int main(int argc, char** argv) {
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // Prefill (sequential for output quality).
+    // Prefill: batch mode (fast) or sequential (exact).
+    int prefill_batch = std::atoi(argval(argc, argv, "--prefill-batch", "0").c_str());
     int32_t next = -1;
-    for (size_t i = 0; i < ids.size(); ++i) {
-        bool last = (i + 1 == ids.size());
-        if (!engine.forward(ids[i], last, &next)) return 1;
+
+    if (prefill_batch > 0 && ids.size() > 1) {
+        // Batch prefill: process prompt in chunks of max_batch.
+        // Uses forward_batch which reads weights once per chunk (multi-M).
+        int32_t predicted[9];
+        size_t i = 0;
+        while (i < ids.size()) {
+            int M = std::min((int)(ids.size() - i), engine.max_batch);
+            if (M == (int)(ids.size() - i) && M <= 2) {
+                // Last 1-2 tokens: use sequential for exact final prediction.
+                for (int j = 0; j < M; ++j) {
+                    bool last = (i + j + 1 == ids.size());
+                    if (!engine.forward(ids[i + j], last, &next)) return 1;
+                }
+            } else {
+                if (!engine.forward_batch(ids.data() + i, M, predicted)) return 1;
+                next = predicted[M - 1];
+            }
+            i += M;
+        }
+    } else {
+        // Sequential prefill (exact output quality).
+        for (size_t i = 0; i < ids.size(); ++i) {
+            bool last = (i + 1 == ids.size());
+            if (!engine.forward(ids[i], last, &next)) return 1;
+        }
     }
     auto t1 = std::chrono::steady_clock::now();
     double ttft = std::chrono::duration<double>(t1 - t0).count();
