@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
     std::string prompt  = argval(argc, argv, "--prompt", "Hello, who are you?");
     int max_tokens = std::atoi(argval(argc, argv, "--max-tokens", "128").c_str());
     int spec_k     = std::atoi(argval(argc, argv, "--spec-k", "4").c_str());
+    int fast_mode  = std::atoi(argval(argc, argv, "--fast", "0").c_str());
 
     viper::Tokenizer tok;
     if (!tok.load(vocabp)) { std::fprintf(stderr, "[cli] tok load failed\n"); return 1; }
@@ -77,6 +78,10 @@ int main(int argc, char** argv) {
     viper::NanbeigeEngine engine;
     engine.max_batch = std::max(spec_k + 1, 5);
     if (!engine.load(modelp)) { std::fprintf(stderr, "[cli] engine load failed\n"); return 1; }
+    if (fast_mode > 0) {
+        engine.cfg.n_passes = 1;  // loop-0 only: halves weight reads
+        std::printf("[cli] FAST MODE: n_passes=1 (22 layers, ~2x speed)\n");
+    }
 
     // Load EAGLE drafter if specified.
     viper::Drafter* drafter = nullptr;
@@ -85,6 +90,13 @@ int main(int argc, char** argv) {
         if (!drafter->load(drafterp)) {
             std::fprintf(stderr, "[cli] drafter load failed, using n-gram fallback\n");
             delete drafter; drafter = nullptr;
+        } else {
+            // Share embed/lm_head/final_norm with base model (saves 1.3 GB VRAM)
+            drafter->set_shared(engine.get_embed(),
+                                engine.get_lm_head_packed(), engine.get_lm_head_scales(),
+                                engine.cfg.vocab, engine.cfg.hidden,
+                                engine.get_final_norm());
+            std::printf("[cli] drafter loaded (shared weights)\n");
         }
     }
 
