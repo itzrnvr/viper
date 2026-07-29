@@ -45,6 +45,7 @@
 #include "kernels/ops/linear_bf16_kernel.h"
 #include "kernels/ops/attn_decode_kernel.h"
 #include "kernels/ops/sampling_kernel.h"
+#include "kernels/ops/linear_multim.h"
 #include "kernels/persistent_forward.h"
 
 namespace viper {
@@ -330,31 +331,34 @@ public:
                 const GpuLayer& lw = layers_[l];
                 const int nQD = nQ * HD, nKVD = nKVh * HD;
 
-                // --- Attention sublayer (batch) ---
+                // --- Attention sublayer (multi-M: weights read once) ---
                 const int slot = loop * cfg.n_layers + l;
                 __nv_bfloat16* v_cache_ptr = kv_v_[slot] + (size_t)pos * nKVh * HD;
-                VK(ops::linear_q4_g64_bf16_rmsnorm(lw.q.packed, lw.q.scales, lw.input_ln,
-                                                    cfg.rms_eps, x_, q_, M, lw.q.out_f, lw.q.in_f, 0));
-                VK(ops::linear_q4_g64_bf16_fused2_rmsnorm(lw.k.packed, lw.k.scales, lw.v.packed, lw.v.scales,
-                                                           lw.input_ln, cfg.rms_eps, x_,
-                                                           kb_, v_cache_ptr, M, lw.k.out_f, lw.k.in_f, 0));
+                // rmsnorm once, reuse for q/k/v
+                VK(ops::rmsnorm_forward_bf16(x_, lw.input_ln, x_norm_, M, H, cfg.rms_eps, 0));
+                VK(ops::linear_q4_multim(lw.q.packed, lw.q.scales, x_norm_, q_,
+                                          M, lw.q.out_f, lw.q.in_f, 0));
+                VK(ops::linear_q4_multim(lw.k.packed, lw.k.scales, x_norm_, kb_,
+                                          M, lw.k.out_f, lw.k.in_f, 0));
+                VK(ops::linear_q4_multim(lw.v.packed, lw.v.scales, x_norm_, v_cache_ptr,
+                                          M, lw.v.out_f, lw.v.in_f, 0));
                 VK(ops::rope_apply_inplace_bf16(q_, kb_, cos_pos, sin_pos,
                                                  1, nQ, nKVh, M, HD, 0));
-                // KV append (k only — v was written directly to cache).
                 VK(cudaMemcpyAsync(kv_k_[slot] + (size_t)pos * nKVh * HD, kb_,
                                    (size_t)M * nKVh * HD * 2, cudaMemcpyDeviceToDevice, 0));
                 VK(ops::attn_batch_bf16(q_, kv_k_[slot], kv_v_[slot], attn_,
                                          M, nQ, nKVh, HD, pos, attn_scale, 0));
-                VK(ops::linear_q4_g64_bf16_residual(lw.o.packed, lw.o.scales, attn_, x_, x_,
-                                                     M, lw.o.out_f, lw.o.in_f, 0));
-                // --- MLP sublayer (batch) ---
-                VK(ops::linear_q4_g64_bf16_fused2_rmsnorm(lw.gate.packed, lw.gate.scales,
-                                                           lw.up.packed, lw.up.scales,
-                                                           lw.post_ln, cfg.rms_eps, x_,
-                                                           g_, u_, M, lw.gate.out_f, lw.gate.in_f, 0));
+                VK(ops::linear_q4_multim_residual(lw.o.packed, lw.o.scales, attn_, x_, x_,
+                                                   M, lw.o.out_f, lw.o.in_f, 0));
+                // --- MLP sublayer (multi-M) ---
+                VK(ops::rmsnorm_forward_bf16(x_, lw.post_ln, x_norm_, M, H, cfg.rms_eps, 0));
+                VK(ops::linear_q4_multim(lw.gate.packed, lw.gate.scales, x_norm_, g_,
+                                          M, lw.gate.out_f, lw.gate.in_f, 0));
+                VK(ops::linear_q4_multim(lw.up.packed, lw.up.scales, x_norm_, u_,
+                                          M, lw.up.out_f, lw.up.in_f, 0));
                 VK(ops::swiglu_inplace_bf16(g_, u_, M * I, 0));
-                VK(ops::linear_q4_g64_bf16_residual(lw.down.packed, lw.down.scales, g_, x_, x_,
-                                                     M, lw.down.out_f, lw.down.in_f, 0));
+                VK(ops::linear_q4_multim_residual(lw.down.packed, lw.down.scales, g_, x_, x_,
+                                                   M, lw.down.out_f, lw.down.in_f, 0));
             }
             VK(ops::rmsnorm_forward_bf16(x_, final_norm_, x_, M, H, cfg.rms_eps, 0));
         }
