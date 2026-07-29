@@ -69,8 +69,8 @@ struct GpuLayer {
 class NanbeigeEngine {
 public:
     ModelConfig cfg;
-    int kv_max_seq = 4096;
-    int max_batch = 1;
+    int kv_max_seq = 2048;
+    int max_batch = 5;
     bool load(const std::string& path) {
         HANDLE hf = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                 nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -188,28 +188,53 @@ public:
 
         const int H = cfg.hidden, I = cfg.intermediate, HD = cfg.head_dim;
         const int nQ = cfg.n_heads * HD, nKV = cfg.n_kv_heads * HD;
-        const int MB = max_batch;  // batch dimension for allocation
+        const int MB = max_batch;
+        // Single-pool allocation for all activation buffers (avoids fragmentation).
+        size_t pool_sz = 0;
+        pool_sz += MB * H * 2 + 255;       // x_
+        pool_sz += MB * H * 2 + 255;       // x_norm_
+        pool_sz += MB * nQ * 2 + 255;      // q_
+        pool_sz += MB * nKV * 2 + 255;     // kb_
+        pool_sz += MB * nKV * 2 + 255;     // vb_
+        pool_sz += MB * nQ * 2 + 255;      // attn_
+        pool_sz += MB * I * 2 + 255;       // g_
+        pool_sz += MB * I * 2 + 255;       // u_
+        pool_sz += cfg.vocab * 2 + 255;    // logits_ (M=1)
+        pool_sz += MB * 4 + 255;           // d_sample_
+        pool_sz += MB * 4 + 255;           // d_id_
+        void* pool = nullptr;
+        if (cudaMalloc(&pool, pool_sz) != cudaSuccess) return false;
+        gpu_allocs_.push_back(pool);
+        auto carve = [&](void** dst, size_t sz) {
+            *dst = pool;
+            pool = (char*)pool + ((sz + 255) & ~(size_t)255);  // 256-byte aligned
+        };
+        carve((void**)&x_, (size_t)MB * H * 2);
+        carve((void**)&x_norm_, (size_t)MB * H * 2);
+        carve((void**)&q_, (size_t)MB * nQ * 2);
+        carve((void**)&kb_, (size_t)MB * nKV * 2);
+        carve((void**)&vb_, (size_t)MB * nKV * 2);
+        carve((void**)&attn_, (size_t)MB * nQ * 2);
+        carve((void**)&g_, (size_t)MB * I * 2);
+        carve((void**)&u_, (size_t)MB * I * 2);
+        carve((void**)&logits_, (size_t)cfg.vocab * 2);
+        carve((void**)&d_sample_, (size_t)MB * 4);
+        carve((void**)&d_id_, (size_t)MB * 4);
+        // RoPE tables (separate allocation — large, accessed by all layers).
+        auto alloc_one = [&](void** d, size_t sz) -> bool {
+            if (cudaMalloc(d, sz) != cudaSuccess) return false;
+            gpu_allocs_.push_back(*d); return true;
+        };
+        if (!alloc_one((void**)&cos_t_, (size_t)kv_max_seq * HD * 4)) return false;
+        if (!alloc_one((void**)&sin_t_, (size_t)kv_max_seq * HD * 4)) return false;
+        VK(ops::rope_precompute_cos_sin(cos_t_, sin_t_, 0, kv_max_seq, cfg.rope_theta, HD, 0));
+        // (rope precompute sync not needed — kernels are on the same stream)
+
+        // Remaining allocations use individual cudaMalloc (KV cache, persistent kernel arrays).
         auto alloc = [&](void** d, size_t sz) -> bool {
             if (cudaMalloc(d, sz) != cudaSuccess) return false;
             gpu_allocs_.push_back(*d); return true;
         };
-        if (!alloc((void**)&x_, (size_t)MB * H * 2)) return false;
-        if (!alloc((void**)&x_norm_, (size_t)MB * H * 2)) return false;
-        if (!alloc((void**)&q_, (size_t)MB * nQ * 2)) return false;
-        if (!alloc((void**)&kb_, (size_t)MB * nKV * 2)) return false;
-        if (!alloc((void**)&vb_, (size_t)MB * nKV * 2)) return false;
-        if (!alloc((void**)&attn_, (size_t)MB * nQ * 2)) return false;
-        if (!alloc((void**)&g_, (size_t)MB * I * 2)) return false;
-        if (!alloc((void**)&u_, (size_t)MB * I * 2)) return false;
-        if (!alloc((void**)&logits_, (size_t)cfg.vocab * 2)) return false;  // M=1 (sequential lm_head)
-        // Pre-compute RoPE cos/sin tables for all positions.
-        if (!alloc((void**)&cos_t_, (size_t)kv_max_seq * HD * 4)) return false;
-        if (!alloc((void**)&sin_t_, (size_t)kv_max_seq * HD * 4)) return false;
-        if (!alloc((void**)&d_sample_, (size_t)MB * 4)) return false;
-        if (!alloc((void**)&d_id_, (size_t)MB * 4)) return false;
-        VK(ops::rope_precompute_cos_sin(cos_t_, sin_t_, 0, kv_max_seq, cfg.rope_theta, HD, 0));
-        // (rope precompute sync not needed — kernels are on the same stream)
-
         // KV cache: position-major [n_kv, max_kv_len, hd] to match kernel.
         kv_slots_ = cfg.n_passes * cfg.n_layers;
         size_t slot_bytes = (size_t)kv_max_seq * cfg.n_kv_heads * HD * 2;
