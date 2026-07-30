@@ -301,6 +301,6 @@ int main(int argc, char** argv) {
     // Cleanup (unreachable)
     closesocket(server_fd);
     WSACleanup();
-    for (auto w : workers) w.join();
+    for (auto& w : workers) w.join();
     return 0;
 }
