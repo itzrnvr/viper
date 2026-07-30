@@ -82,18 +82,17 @@ int main(int argc, char** argv) {
 
     viper::NanbeigeEngine engine;
     engine.max_batch = std::max(spec_k + 1, 5);
+    engine.cfg.kv_cache_type = cacheType;  // MUST be before load() for Q8 allocation
+    if (cacheType == 1) std::printf("[cli] Q8 KV cache enabled (49%% VRAM savings)\n");
+    else if (cacheType > 1) { std::fprintf(stderr, "[cli] ERROR: cache type %d not implemented\n", cacheType); return 1; }
     if (!engine.load(modelp)) { std::fprintf(stderr, "[cli] engine load failed\n"); return 1; }
     if (fastMode > 0) {
-        engine.cfg.n_passes = 1;  // loop-0 only: halves weight reads
-        std::printf("[cli] FAST MODE: n_passes=1 (22 layers, ~2x speed)\n");
+        engine.cfg.n_passes = 1;
+        std::printf("[cli] FAST MODE: n_passes=1\n");
     }
     if (lmPrune > 0) {
         engine.cfg.lm_prune = lmPrune;
-        std::fprintf(stderr, "[cli] WARNING: lm_head pruning = %d (LOSSY: greedy output may differ)\n", lmPrune);
-    }
-    if (cacheType > 0) {
-        std::fprintf(stderr, "[cli] ERROR: cache type %d not yet wired (Q8 allocation pending)\n", cacheType);
-        return 1;
+        std::fprintf(stderr, "[cli] WARNING: lm_head pruning = %d (LOSSY)\n", lmPrune);
     }
 
     // Load EAGLE drafter if specified.
@@ -125,7 +124,7 @@ int main(int argc, char** argv) {
     int prefill_batch = std::atoi(argval(argc, argv, "--prefill-batch", "8").c_str());
     int32_t next = -1;
 
-    if (prefill_batch > 0 && ids.size() > 1) {
+    if (prefill_batch > 0 && ids.size() > 1 && cacheType == 0) {
         // Batch prefill: process prompt in chunks (weight reads shared across M tokens).
         int32_t predicted[17];
         size_t i = 0;

@@ -50,6 +50,7 @@
 #include "kernels/ops/rmsnorm_quantize.h"
 #include "kernels/ops/dp4a_smem_kernel.h"
 #include "kernels/ops/swiglu_quantize.h"
+#include "kernels/ops/q8_kv_cache.cuh"
 
 namespace viper {
 
@@ -271,6 +272,21 @@ public:
         }
         std::printf("[viper] KV cache: %d slots x %d tok (%.2f GB)\n",
                     kv_slots_, kv_max_seq, 2.0 * kv_slots_ * slot_bytes / 1e9);
+        // Q8 KV cache (when enabled)
+        if (cfg.kv_cache_type == KV_Q8) {
+            size_t q8_data = (size_t)kv_max_seq * cfg.n_kv_heads * HD;
+            size_t q8_sc = (size_t)kv_max_seq * cfg.n_kv_heads * sizeof(__nv_bfloat16);
+            q8_k_cache_.resize(kv_slots_); q8_v_cache_.resize(kv_slots_);
+            q8_k_scales_.resize(kv_slots_); q8_v_scales_.resize(kv_slots_);
+            for (int s = 0; s < kv_slots_; ++s) {
+                if (!alloc((void**)&q8_k_cache_[s], q8_data)) return false;
+                if (!alloc((void**)&q8_v_cache_[s], q8_data)) return false;
+                if (!alloc((void**)&q8_k_scales_[s], q8_sc)) return false;
+                if (!alloc((void**)&q8_v_scales_[s], q8_sc)) return false;
+            }
+            std::printf("[viper] Q8 KV cache: %d slots (%.2f GB)\n", kv_slots_,
+                        (double)kv_slots_ * (q8_data + q8_sc) * 2 / 1e9);
+        }
 
         // Device-side copies for persistent kernel.
         if (!alloc((void**)&d_layers_, sizeof(GpuLayer) * cfg.n_layers)) return false;
@@ -453,7 +469,17 @@ private:
                                                d_q8_, d_q8s_, kb_, v_cache_ptr, 1, lw.k.out_f, lw.k.in_f, s_));
                 if (prof && l == 0 && loop == 0) cudaEventRecord(ev[2], s_);
                 VK(ops::rope_q_k_fused(q_, vb_, kb_, kv_k_[slot], pos, nKVh, nQ, nKVh, cos_pos, sin_pos, HD, s_));
-                VK(ops::attn_decode_bf16(vb_, kv_k_[slot], kv_v_[slot], attn_, nQ, nKVh, HD, pos + 1, attn_scale, s_));
+                if (cfg.kv_cache_type == KV_Q8) {
+                    VK(ops::k_to_q8_cache(kv_k_[slot] + (size_t)pos * nKVh * HD,
+                                           q8_k_cache_[slot], q8_k_scales_[slot], pos, nKVh, HD, s_));
+                    VK(ops::v_to_q8_cache(v_cache_ptr, q8_v_cache_[slot], q8_v_scales_[slot], pos, nKVh, HD, s_));
+                    VK(ops::attn_decode_q8(vb_, q8_k_cache_[slot], q8_k_scales_[slot],
+                                            q8_v_cache_[slot], q8_v_scales_[slot], attn_,
+                                            nQ, nKVh, HD, pos + 1, attn_scale, s_));
+                } else {
+                    VK(ops::attn_decode_bf16(vb_, kv_k_[slot], kv_v_[slot], attn_,
+                                             nQ, nKVh, HD, pos + 1, attn_scale, s_));
+                }
                 if (prof && l == 0 && loop == 0) cudaEventRecord(ev[3], s_);
                 VK(ops::quantize_to_q8(attn_, d_q8_, d_q8s_, 1, nQ * HD, s_));
                 VK(ops::dp4a_smem_gemv_residual(lw.o.packed, lw.o.scales, d_q8_, d_q8s_, x_, x_, 1, lw.o.out_f, lw.o.in_f, s_));
@@ -513,6 +539,9 @@ private:
     // Q8 activation buffers for DP4A GEMV (lazy allocated)
     int8_t* d_q8_ = nullptr;
     float* d_q8s_ = nullptr;
+    // Q8 KV cache (allocated when kv_cache_type == KV_Q8)
+    std::vector<int8_t*> q8_k_cache_, q8_v_cache_;
+    std::vector<__nv_bfloat16*> q8_k_scales_, q8_v_scales_;
 
     // ---- CUDA Graph state ----
     cudaStream_t s_ = 0;           // custom stream (0 = default)

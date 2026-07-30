@@ -117,70 +117,8 @@ __global__ void v_to_q8_cache_kernel(
             __bfloat162float(v_src[h * HD + d]) * inv_scale);
 }
 
-// Attention decode with Q8 KV cache.
-// Dequantizes K/V inline during attention computation.
-// Grid: (nQ) blocks, each block handles 1 query head.
-__global__ void attn_decode_q8_kernel(
-    const __nv_bfloat16* __restrict__ q,          // [nQ, HD] BF16 query
-    const int8_t* __restrict__ k_cache_q8,        // [T, nKV, HD] INT8 K cache
-    const __nv_bfloat16* __restrict__ k_scales,   // [T, nKV] FP16 K scales
-    const int8_t* __restrict__ v_cache_q8,        // [T, nKV, HD] INT8 V cache
-    const __nv_bfloat16* __restrict__ v_scales,   // [T, nKV] FP16 V scales
-    __nv_bfloat16* __restrict__ out,               // [nQ, HD] output
-    int nQ, int nKV, int HD, int T_ctx, float scale) {
-    const int h = blockIdx.x;
-    if (h >= nQ) return;
-    const int h_kv = h / (nQ / nKV);  // GQA: nQ/nKV = 6
-    const int tid = threadIdx.x;
-
-    // Load query to registers
-    float q_vec[128];
-    #pragma unroll
-    for (int d = tid; d < HD; d += blockDim.x)
-        q_vec[d] = __bfloat162float(q[h * HD + d]);
-    __syncthreads();
-
-    // Attention scores (online softmax)
-    float max_score = -1e30f;
-    __shared__ float scores[2048];  // max context per position
-    int n_ctx = min(T_ctx, 2048);
-
-    for (int t = 0; t < n_ctx; ++t) {
-        float dot = 0.f;
-        __nv_bfloat16 k_scale = k_scales[(size_t)t * nKV + h_kv];
-        float k_sc = __bfloat162float(k_scale);
-        const int8_t* k_row = k_cache_q8 + (size_t)t * nKV * HD + h_kv * HD;
-        for (int d = tid; d < HD; d += blockDim.x)
-            dot += q_vec[d] * (float)k_row[d] * k_sc;
-        // Warp reduce
-        for (int off = 16; off > 0; off >>= 1)
-            dot += __shfl_xor_sync(0xffffffff, dot, off);
-        if (tid == 0) {
-            scores[t] = dot * scale;
-            max_score = fmaxf(max_score, scores[t]);
-        }
-        __syncthreads();
-    }
-
-    // Softmax + weighted V sum
-    float sum_exp = 0.f;
-    for (int t = 0; t < n_ctx; ++t) {
-        scores[t] = expf(scores[t] - max_score);
-        sum_exp += scores[t];
-    }
-    float inv_sum = 1.f / sum_exp;
-
-    for (int d = tid; d < HD; d += blockDim.x) {
-        float acc = 0.f;
-        for (int t = 0; t < n_ctx; ++t) {
-            __nv_bfloat16 v_scale = v_scales[(size_t)t * nKV + h_kv];
-            float v_sc = __bfloat162float(v_scale);
-            const int8_t* v_row = v_cache_q8 + (size_t)t * nKV * HD + h_kv * HD;
-            acc += scores[t] * inv_sum * (float)v_row[d] * v_sc;
-        }
-        out[h * HD + d] = __float2bfloat16(acc);
-    }
-}
+// attn_decode_q8 is implemented in attn_decode_kernel.cu (correct flash-style version)
+// Only quantize/dequantize kernels are kept here.
 
 // Launchers
 cudaError_t k_to_q8_cache(
@@ -197,18 +135,6 @@ cudaError_t v_to_q8_cache(
     return cudaGetLastError();
 }
 
-cudaError_t attn_decode_q8(
-    const __nv_bfloat16* q,
-    const int8_t* k_cache_q8, const __nv_bfloat16* k_scales,
-    const int8_t* v_cache_q8, const __nv_bfloat16* v_scales,
-    __nv_bfloat16* out,
-    int nQ, int nKV, int HD, int T_ctx, float scale,
-    cudaStream_t stream) {
-    attn_decode_q8_kernel<<<nQ, 128, 0, stream>>>(
-        q, k_cache_q8, k_scales, v_cache_q8, v_scales, out,
-        nQ, nKV, HD, T_ctx, scale);
-    return cudaGetLastError();
-}
 
 }  // namespace ops
 }  // namespace viper
