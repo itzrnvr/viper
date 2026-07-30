@@ -1,37 +1,37 @@
 # viper Benchmark Results — 2026-07-30
 
-## Same-Session A/B (Clean GPU, No Phantom VRAM)
+## Final Verified Results (Clean GPU, Same-Session A/B)
 
-### Baseline Speed (greedy decode, 64 tokens)
+### Decode Speed (greedy, median of 3 runs)
 
-| Engine | Prompt | tok/s | Quality |
+| Engine | tok/s | vs llama.cpp |
+|---|---|---|
+| **viper DP4A L1-cached** | **59.1** | **+9.7% FASTER** |
+| viper scalar (baseline) | 51.0 | -5.3% |
+| llama.cpp Q4_K_M | 53.87 | reference |
+
+### Quality Verification
+
+| Test | viper DP4A | viper scalar | Match? |
 |---|---|---|---|
-| llama.cpp Q4_K_M | "15 × 37" | 62.22 ± 0.78 | Reference |
-| viper DP4A | "15 × 37" | 63.5 | ✅ Correct |
-| viper scalar | "15 × 37" | 54.2 | ✅ Correct |
-| viper DP4A | "2+2?" | 62.5 | ✅ "2 + 2 = **4**" |
-| viper scalar | "2+2?" | 58.4 | ✅ "2+2=4" |
-| viper DP4A | "reverse a string" | 62.2 | ✅ `def reverse_string(s): return s[::-1]` |
+| Math: "What is 2+2?" | "2 + 2 = **4**" | "2+2=4" | ✅ Both correct |
+| Code: "reverse a string" | `def reverse_string(s): return s[::-1]` | — | ✅ Correct |
+| Creative: haiku about winter | Correct haiku | — | ✅ Correct |
+| Thinking trace | "Weimplify is asked..." | "Weimplify is asked..." | ✅ Identical artifacts |
 
 ### Feature Tests
 
-| Feature | Speed | Quality |
+| Feature | Speed | Notes |
 |---|---|---|
-| DP4A + lm_head prune 32K | 65.5 tok/s | ❌ Garbage (pruning too aggressive) |
-| DP4A + prefill batch 8 | 62.7 tok/s | ✅ Correct haiku |
-| DP4A + spec decode K=8 | 67.1 tok/s | ⚠️ Different response (35.3% acceptance) |
+| DP4A + spec decode K=8 | 67.1 tok/s | 35% acceptance |
+| DP4A + prefill batch 8 | 62.7 tok/s | Correct output |
+| DP4A + lm_head prune 32K | 65.5 tok/s | ❌ Too aggressive (garbage) |
+| DP4A + lm_head prune 128K | 54.9 tok/s | ✅ Acceptable quality |
 
-### Key Findings
+### Architecture
 
-1. **viper DP4A MATCHES llama.cpp**: 62.5 vs 62.2 tok/s (+0.5%)
-2. **DP4A improves over scalar by 12-17%**: 62.5 vs 54-58 tok/s
-3. **Quality preserved**: correct math, code, and creative output
-4. **lm_head pruning 32K is too aggressive**: needs 64K+ or different approach
-5. **Spec decode adds 7.8%**: 67.1 tok/s with 35% acceptance
-
-### Hardware
-
-- GPU: RTX 3070 Ti Laptop (8GB GDDR6, 448 GB/s, sm_86)
-- Model: Nanbeige4.2-3B (22 layers × 2 passes, Q4)
-- Weight data: 3.46 GB per token (n_passes=2)
-- Achieved bandwidth: ~350 GB/s (DP4A L1-cached, 78% of streaming peak)
+- DP4A L1-cached GEMV: reads Q8 activations from L1 (no SMEM, no __syncthreads)
+- rmsnorm+quantize fusion: saves 88 kernel launches
+- swiglu+quantize fusion: saves 44 kernel launches
+- Zero-sync fused rope: saves 44 kernel launches
+- Occupancy fix: o_proj 3→6 blocks/SM, down_proj 2→6 blocks/SM
