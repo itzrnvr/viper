@@ -21,6 +21,19 @@ cudaError_t attn_decode_bf16(
     float scale,
     cudaStream_t stream);
 
+// Q8 KV cache variant: reads INT8 K/V + FP16 per-head scales.
+// Same flash-style online softmax, dequantizes inline.
+cudaError_t attn_decode_q8(
+    const __nv_bfloat16* __restrict__ q,
+    const int8_t* __restrict__ k_cache_q8,     // [T_ctx, nKV, D]
+    const __nv_bfloat16* __restrict__ k_scales, // [T_ctx, nKV]
+    const int8_t* __restrict__ v_cache_q8,     // [T_ctx, nKV, D]
+    const __nv_bfloat16* __restrict__ v_scales, // [T_ctx, nKV]
+    __nv_bfloat16* __restrict__ out,
+    int nQ, int nKV, int D, int T_ctx,
+    float scale,
+    cudaStream_t stream);
+
 // Batch attention with causal masking (for speculative decode verification).
 // Grid: (nQ, M). Token m attends to positions 0..pos_start+m.
 //   q: [M, nQ, D]
