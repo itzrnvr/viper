@@ -65,6 +65,7 @@
 #include "kernels/ops/q4_kv_cache.cuh"
 #include "kernels/ops/q6_kv_cache.cuh"
 #include "kernels/ops/q8_dequant.cuh"
+#include "kernels/ops/flash_decode.cuh"
 
 namespace viper {
 
@@ -82,6 +83,7 @@ struct ModelConfig {
     float rope_theta = 70000000.0f;
     int kv_cache_type = KV_BF16;  // 0=BF16, 1=Q8, 2=Q6, 3=Q4, 4=TurboQuant
     int lm_prune = 0;  // 0=full vocab, >0=only compute first N logits (lossy)
+    bool use_flash_attn = false;  // flash decoding for BF16 attention
 };
 
 struct GpuLinearQ4 {
@@ -533,8 +535,13 @@ private:
                                             q4_v_cache_[slot], q4_v_scales_[slot], attn_,
                                             nQ, nKVh, HD, pos + 1, attn_scale, s_));
                 } else {
-                    VK(ops::attn_decode_bf16(vb_, kv_k_[slot], kv_v_[slot], attn_,
-                                             nQ, nKVh, HD, pos + 1, attn_scale, s_));
+                    if (cfg.use_flash_attn) {
+                        VK(ops::flash_decode_bf16(vb_, kv_k_[slot], kv_v_[slot], attn_,
+                                                   nQ, nKVh, HD, pos + 1, attn_scale, s_));
+                    } else {
+                        VK(ops::attn_decode_bf16(vb_, kv_k_[slot], kv_v_[slot], attn_,
+                                                 nQ, nKVh, HD, pos + 1, attn_scale, s_));
+                    }
                 }
                 if (prof && l == 0 && loop == 0) cudaEventRecord(ev[3], s_);
                 VK(ops::quantize_to_q8(attn_, d_q8_, d_q8s_, 1, nQ * HD, s_));

@@ -75,6 +75,7 @@ int main(int argc, char** argv) {
     int useGraph = std::atoi(argval(argc, argv, "--graph", "0").c_str());
     int lmPrune = std::atoi(argval(argc, argv, "--lm-head-prune", "0").c_str());
     int cacheType = std::atoi(argval(argc, argv, "--cache-type", "0").c_str());  // 0=bf16 1=q8 2=q6 3=q4
+    int flashAttn = std::atoi(argval(argc, argv, "--flash-attn", "0").c_str());  // 1=force flash decoding
     if (usePersistent > 0 || useGraph > 0) spec_k = 0;  // graph/persistent: single-token decode
 
     viper::Tokenizer tok;
@@ -91,6 +92,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[cli] ERROR: cache type %d not implemented (0=BF16, 1=Q8, 2=Q6, 3=Q4)\n", cacheType);
         return 1;
     }
+    engine.cfg.use_flash_attn = (flashAttn > 0);
+    if (flashAttn > 0) std::printf("[cli] flash decoding enabled\n");
     if (!engine.load(modelp)) { std::fprintf(stderr, "[cli] engine load failed\n"); return 1; }
     if (fastMode > 0) {
         engine.cfg.n_passes = 1;

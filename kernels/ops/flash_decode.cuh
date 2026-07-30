@@ -62,7 +62,8 @@ __global__ void flash_decode_bf16_kernel(
 
     // --- Shared scratch ---
     __shared__ float tile_scores[TILE];
-    __shared__ float smem_reduce[4];
+    __shared__ float smem_max[4];
+    __shared__ float smem_sum[4];
 
     // --- Per-thread online softmax accumulators (one per output dim) ---
     float m_run = -1e30f;
@@ -105,19 +106,18 @@ __global__ void flash_decode_bf16_kernel(
         for (int ti = tid; ti < tile_n; ti += blockDim.x)
             m_tile = fmaxf(m_tile, tile_scores[ti]);
         for (int off = 16; off > 0; off >>= 1)
-            m_tile = fmaxf(m_tile, __shfl_xor_sync(0xffffffff, m_tile, off));
-        if (lid == 0) smem_reduce[wid] = m_tile;
+        if (lid == 0) smem_max[wid] = m_tile;
         __syncthreads();
 
         if (tid == 0) {
-            float m = smem_reduce[0];
-            for (int i = 1; i < 4; ++i) m = fmaxf(m, smem_reduce[i]);
-            smem_reduce[0] = m;
+            float m = smem_max[0];
+            for (int i = 1; i < 4; ++i) m = fmaxf(m, smem_max[i]);
+            smem_max[0] = m;
         }
         __syncthreads();
 
         // BUG FIX: m_new must be max(running, tile), not tile alone
-        const float m_new = fmaxf(m_run, smem_reduce[0]);
+        const float m_new = fmaxf(m_run, smem_max[0]);
         const float scale_old = expf(m_run - m_new);
 
         // Compute exp(score - m_new) and sum
@@ -128,17 +128,17 @@ __global__ void flash_decode_bf16_kernel(
         }
         for (int off = 16; off > 0; off >>= 1)
             l_tile += __shfl_xor_sync(0xffffffff, l_tile, off);
-        if (lid == 0) smem_reduce[wid] = l_tile;
+        if (lid == 0) smem_sum[wid] = l_tile;
         __syncthreads();
 
         if (tid == 0) {
             float l_all = 0;
-            for (int i = 0; i < 4; ++i) l_all += smem_reduce[i];
-            smem_reduce[0] = l_all;
+            for (int i = 0; i < 4; ++i) l_all += smem_sum[i];
+            smem_sum[0] = l_all;
         }
         __syncthreads();
 
-        l_run = l_run * scale_old + smem_reduce[0];
+        l_run = l_run * scale_old + smem_sum[0];
         acc *= scale_old;
         m_run = m_new;
 
