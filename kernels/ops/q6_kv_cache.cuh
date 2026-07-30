@@ -68,11 +68,21 @@ __global__ void kv_bf16_to_q6_kernel(
         gmax = fmaxf(gmax, fabsf(__bfloat162float(kv_bf16[h * HD + d])));
     for (int off = 16; off > 0; off >>= 1)
         gmax = fmaxf(gmax, __shfl_xor_sync(0xffffffff, gmax, off));
-
-    float scale = fmaxf(gmax / 31.0f, 1e-8f);  // 6-bit signed: range -32..31
-    if (tid == 0) kv_scales[h] = __float2bfloat16(scale);
+    __shared__ float q6_warp_max[8];
+    const int wid = tid >> 5, lid = tid & 31;
+    if (lid == 0) q6_warp_max[wid] = gmax;
+    __syncthreads();
+    __shared__ float q6_s_gmax;
+    if (tid == 0) {
+        float m = q6_warp_max[0];
+        for (int i = 1; i < (blockDim.x >> 5); ++i) m = fmaxf(m, q6_warp_max[i]);
+        q6_s_gmax = m;
+    }
     __syncthreads();
 
+    float scale = fmaxf(q6_s_gmax / 31.0f, 1e-8f);
+    if (tid == 0) kv_scales[h] = __float2bfloat16(scale);
+    __syncthreads();
     float inv_scale = 1.0f / scale;
     uint8_t* out = kv_q6 + (size_t)h * (HD / 4 * 3);
 
@@ -116,8 +126,19 @@ __global__ void kv_to_q6_cache_kernel(
         gmax = fmaxf(gmax, fabsf(__bfloat162float(kv_src[h * HD + d])));
     for (int off = 16; off > 0; off >>= 1)
         gmax = fmaxf(gmax, __shfl_xor_sync(0xffffffff, gmax, off));
+    __shared__ float q6c_warp_max[8];
+    const int cwid = tid >> 5, clid = tid & 31;
+    if (clid == 0) q6c_warp_max[cwid] = gmax;
+    __syncthreads();
+    __shared__ float q6c_s_gmax;
+    if (tid == 0) {
+        float m = q6c_warp_max[0];
+        for (int i = 1; i < (blockDim.x >> 5); ++i) m = fmaxf(m, q6c_warp_max[i]);
+        q6c_s_gmax = m;
+    }
+    __syncthreads();
 
-    float scale = fmaxf(gmax / 31.0f, 1e-8f);
+    float scale = fmaxf(q6c_s_gmax / 31.0f, 1e-8f);
     if (tid == 0) scale_row[h] = __float2bfloat16(scale);
     __syncthreads();
 
