@@ -88,8 +88,9 @@ int main(int argc, char** argv) {
     if (cacheType == 1) std::printf("[cli] Q8 KV cache (49%% VRAM savings)\n");
     else if (cacheType == 2) std::printf("[cli] Q6 KV cache (62.5%% VRAM savings vs BF16)\n");
     else if (cacheType == 3) std::printf("[cli] Q4 KV cache (75%% VRAM savings, enables 128K context)\n");
-    else if (cacheType > 0) {
-        std::fprintf(stderr, "[cli] ERROR: cache type %d not implemented (0=BF16, 1=Q8, 2=Q6, 3=Q4)\n", cacheType);
+    else if (cacheType == 4) std::printf("[cli] TurboQuant KV cache (mixed Q8/Q6/Q4 per head)\n");
+    else if (cacheType > 4) {
+        std::fprintf(stderr, "[cli] ERROR: cache type %d not implemented (0=BF16, 1=Q8, 2=Q6, 3=Q4, 4=TurboQuant)\n", cacheType);
         return 1;
     }
     engine.cfg.use_flash_attn = (flashAttn > 0);

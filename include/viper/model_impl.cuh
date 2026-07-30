@@ -66,6 +66,7 @@
 #include "kernels/ops/q6_kv_cache.cuh"
 #include "kernels/ops/q8_dequant.cuh"
 #include "kernels/ops/flash_decode.cuh"
+#include "kernels/ops/turboquant_kv.cuh"
 
 namespace viper {
 
@@ -331,6 +332,30 @@ public:
             std::printf("[viper] Q4 KV cache: %d slots (%.2f GB, enables 128K context)\n", kv_slots_,
                         (double)kv_slots_ * (q4_data + q4_sc) * 2 / 1e9);
         }
+        if (cfg.kv_cache_type == KV_TURBO) {
+            ops::TurboQuantConfig tq_cfg;
+            int tq_total = tq_cfg.total_bytes(HD);
+            size_t tq_data = (size_t)kv_max_seq * tq_total;
+            size_t tq_sc = (size_t)kv_max_seq * cfg.n_kv_heads * sizeof(__nv_bfloat16);
+            turbo_k_cache_.resize(kv_slots_); turbo_v_cache_.resize(kv_slots_);
+            turbo_k_scales_.resize(kv_slots_); turbo_v_scales_.resize(kv_slots_);
+            for (int s = 0; s < kv_slots_; ++s) {
+                if (!alloc((void**)&turbo_k_cache_[s], tq_data)) return false;
+                if (!alloc((void**)&turbo_v_cache_[s], tq_data)) return false;
+                if (!alloc((void**)&turbo_k_scales_[s], tq_sc)) return false;
+                if (!alloc((void**)&turbo_v_scales_[s], tq_sc)) return false;
+            }
+            // Device arrays for head format and offsets
+            int h_fmt[8] = {0,0,1,1,2,2,2,2};
+            int h_off[9]; tq_cfg.compute_offsets(h_off, HD);
+            alloc((void**)&d_head_fmt_, sizeof(int)*8);
+            alloc((void**)&d_head_offsets_, sizeof(int)*9);
+            cudaMemcpy(d_head_fmt_, h_fmt, sizeof(int)*8, cudaMemcpyHostToDevice);
+            cudaMemcpy(d_head_offsets_, h_off, sizeof(int)*9, cudaMemcpyHostToDevice);
+            turbo_total_offset_ = tq_total;
+            std::printf("[viper] TurboQuant KV: %d slots (%.2f GB, mixed Q8/Q6/Q4)\n", kv_slots_,
+                        (double)kv_slots_ * (tq_data + tq_sc) * 2 / 1e9);
+        }
 
         // Device-side copies for persistent kernel.
         if (!alloc((void**)&d_layers_, sizeof(GpuLayer) * cfg.n_layers)) return false;
@@ -534,6 +559,15 @@ private:
                     VK(ops::attn_decode_q4(vb_, q4_k_cache_[slot], q4_k_scales_[slot],
                                             q4_v_cache_[slot], q4_v_scales_[slot], attn_,
                                             nQ, nKVh, HD, pos + 1, attn_scale, s_));
+                } else if (cfg.kv_cache_type == KV_TURBO) {
+                    VK(ops::kv_to_turbo_cache(kv_k_[slot] + (size_t)pos * nKVh * HD,
+                                               turbo_k_cache_[slot], turbo_k_scales_[slot],
+                                               d_head_fmt_, d_head_offsets_, pos, nKVh, HD, turbo_total_offset_, s_));
+                    VK(ops::kv_to_turbo_cache(v_cache_ptr, turbo_v_cache_[slot], turbo_v_scales_[slot],
+                                               d_head_fmt_, d_head_offsets_, pos, nKVh, HD, turbo_total_offset_, s_));
+                    VK(ops::attn_decode_turbo(vb_, turbo_k_cache_[slot], turbo_k_scales_[slot],
+                                               turbo_v_cache_[slot], turbo_v_scales_[slot], attn_,
+                                               nQ, nKVh, HD, pos + 1, attn_scale, turbo_total_offset_, s_));
                 } else {
                     if (cfg.use_flash_attn) {
                         VK(ops::flash_decode_bf16(vb_, kv_k_[slot], kv_v_[slot], attn_,
@@ -586,6 +620,12 @@ private:
     // Q6 KV cache (when kv_cache_type == KV_Q6)
     std::vector<uint8_t*> q6_k_cache_, q6_v_cache_;
     std::vector<__nv_bfloat16*> q6_k_scales_, q6_v_scales_;
+    // TurboQuant KV cache (when kv_cache_type == KV_TURBO)
+    std::vector<uint8_t*> turbo_k_cache_, turbo_v_cache_;
+    std::vector<__nv_bfloat16*> turbo_k_scales_, turbo_v_scales_;
+    int* d_head_fmt_ = nullptr;
+    int* d_head_offsets_ = nullptr;
+    int turbo_total_offset_ = 0;
     std::vector<GpuLayer> layers_;
     const __nv_bfloat16* embed_ = nullptr;
     GpuLinearQ4 lm_head_q4_;

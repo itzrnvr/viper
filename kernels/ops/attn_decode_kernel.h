@@ -58,6 +58,17 @@ cudaError_t attn_decode_q6(
     float scale,
     cudaStream_t stream);
 
+// TurboQuant KV cache: mixed Q8/Q6/Q4 per head group.
+cudaError_t attn_decode_turbo(
+    const __nv_bfloat16* __restrict__ q,
+    const uint8_t* __restrict__ k_cache,     // [T, total_offset] mixed-precision
+    const __nv_bfloat16* __restrict__ k_scales,
+    const uint8_t* __restrict__ v_cache,
+    const __nv_bfloat16* __restrict__ v_scales,
+    __nv_bfloat16* __restrict__ out,
+    int nQ, int nKV, int D, int T_ctx, float scale, int total_offset,
+    cudaStream_t stream);
+
 // Batch attention with causal masking (for speculative decode verification).
 // Grid: (nQ, M). Token m attends to positions 0..pos_start+m.
 //   q: [M, nQ, D]

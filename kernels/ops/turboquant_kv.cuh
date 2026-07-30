@@ -69,17 +69,28 @@ __global__ void kv_to_turbo_cache_kernel(
     int fmt = head_fmt[h];
 
     uint8_t* cache_ptr = kv_cache + (size_t)pos * total_offset + head_offsets[h];
-    __nv_bfloat16* scale_ptr = kv_scales + (size_t)pos * nKV + h;
+    __nv_bfloat16* scale_ptr = kv_scales + (size_t)pos * nKV + h;  // already includes head offset
 
     float gmax = 0.f;
     for (int d = tid; d < HD; d += blockDim.x)
         gmax = fmaxf(gmax, fabsf(__bfloat162float(kv_src[h * HD + d])));
     for (int off = 16; off > 0; off >>= 1)
         gmax = fmaxf(gmax, __shfl_xor_sync(0xffffffff, gmax, off));
+    __shared__ float tq_warp_max[8];
+    const int wid = tid >> 5, lid = tid & 31;
+    if (lid == 0) tq_warp_max[wid] = gmax;
+    __syncthreads();
+    __shared__ float tq_s_gmax;
+    if (tid == 0) {
+        float m = tq_warp_max[0];
+        for (int i = 1; i < (blockDim.x >> 5); ++i) m = fmaxf(m, tq_warp_max[i]);
+        tq_s_gmax = m;
+    }
+    __syncthreads();
 
     float divisor = (fmt == 0) ? 127.0f : (fmt == 1) ? 31.0f : 7.0f;
-    float scale = fmaxf(gmax / divisor, 1e-8f);
-    if (tid == 0) scale_ptr[h] = __float2bfloat16(scale);
+    float scale = fmaxf(tq_s_gmax / divisor, 1e-8f);
+    if (tid == 0) scale_ptr[0] = __float2bfloat16(scale);
     __syncthreads();
 
     float inv_scale = 1.0f / scale;
@@ -90,19 +101,19 @@ __global__ void kv_to_turbo_cache_kernel(
             cache_ptr[d] = (int8_t)__float2int_rn(
                 __bfloat162float(kv_src[h * HD + d]) * inv_scale);
     } else if (fmt == 1) {
-        // Q6: 3 bytes per 4 elements
+        // Q6: 3 bytes per 4 elements (two's complement, no bias)
         if (tid < HD / 4) {
             int base = tid * 4;
             int q[4];
             for (int i = 0; i < 4; ++i)
                 q[i] = max(-32, min(31, (int)roundf(
                     __bfloat162float(kv_src[h * HD + base + i]) * inv_scale)));
-            cache_ptr[tid * 3]     = (q[0]+32) | ((q[1]+32) << 6);
-            cache_ptr[tid * 3 + 1] = ((q[1]+32) >> 2) | ((q[2]+32) << 4);
-            cache_ptr[tid * 3 + 2] = ((q[2]+32) >> 4) | ((q[3]+32) << 2);
+            cache_ptr[tid * 3]     = (uint8_t)((q[0] & 0x3F) | ((q[1] & 0x3F) << 6));
+            cache_ptr[tid * 3 + 1] = (uint8_t)(((q[1] >> 2) & 0x3F) | ((q[2] & 0x3F) << 4));
+            cache_ptr[tid * 3 + 2] = (uint8_t)(((q[2] >> 4) & 0x3F) | ((q[3] & 0x3F) << 2));
         }
     } else {
-        // Q4: 1 byte per 2 elements
+        // Q4: 1 byte per 2 elements (offset encoding +8)
         if (tid < HD / 2) {
             int q0 = max(-8, min(7, (int)roundf(
                 __bfloat162float(kv_src[h * HD + tid * 2]) * inv_scale)));
