@@ -76,6 +76,7 @@ int main(int argc, char** argv) {
     int lmPrune = std::atoi(argval(argc, argv, "--lm-head-prune", "0").c_str());
     int cacheType = std::atoi(argval(argc, argv, "--cache-type", "0").c_str());  // 0=bf16 1=q8 2=q6 3=q4
     int flashAttn = std::atoi(argval(argc, argv, "--flash-attn", "0").c_str());  // 1=force flash decoding
+    int prefillBatch = std::atoi(argval(argc, argv, "--prefill-batch", "8").c_str());
     if (usePersistent > 0 || useGraph > 0) spec_k = 0;  // graph/persistent: single-token decode
 
     viper::Tokenizer tok;
@@ -83,7 +84,7 @@ int main(int argc, char** argv) {
     std::printf("[cli] tokenizer loaded\n");
 
     viper::NanbeigeEngine engine;
-    engine.max_batch = std::max(spec_k + 1, 5);
+    engine.max_batch = std::max(std::max(spec_k + 1, 5), prefillBatch);
     engine.cfg.kv_cache_type = cacheType;
     if (cacheType == 1) std::printf("[cli] Q8 KV cache (49%% VRAM savings)\n");
     else if (cacheType == 2) std::printf("[cli] Q6 KV cache (62.5%% VRAM savings vs BF16)\n");
@@ -131,12 +132,11 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
 
     // Prefill: batch mode (fast) or sequential (exact).
-    int prefill_batch = std::atoi(argval(argc, argv, "--prefill-batch", "8").c_str());
     int32_t next = -1;
 
-    if (prefill_batch > 0 && ids.size() > 1 && cacheType == 0) {
+    if (prefillBatch > 0 && ids.size() > 1 && cacheType == 0) {
         // Batch prefill: process prompt in chunks (weight reads shared across M tokens).
-        int32_t predicted[17];
+        int32_t predicted[256];  // max prefill batch
         size_t i = 0;
         while (i < ids.size()) {
             int M = std::min((int)(ids.size() - i), engine.max_batch);
