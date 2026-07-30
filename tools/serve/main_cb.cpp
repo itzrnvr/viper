@@ -252,11 +252,19 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n_slots; ++i) {
         EngineSlot* slot = new EngineSlot();
         slot->engine.max_batch = 8;
-        if (!slot->engine.load(modelp)) {
-            fprintf(stderr, "[server] engine %d load failed\n", i);
-            return 1;
+        if (i == 0) {
+            if (!slot->engine.load(modelp)) {
+                fprintf(stderr, "[server] engine %d load failed\n", i);
+                return 1;
+            }
+        } else {
+            // Share weights from slot 0 (saves 3.46 GB per slot)
+            if (!slot->engine.load_shared(g_state.slots[0]->engine)) {
+                fprintf(stderr, "[server] engine %d shared load failed\n", i);
+                return 1;
+            }
         }
-        printf("[server] slot %d: engine loaded\n", i);
+        printf("[server] slot %d: engine loaded%s\n", i, i == 0 ? "" : " (shared weights)");
         g_state.slots.push_back(slot);
         g_state.free_slots.push(i);
     }

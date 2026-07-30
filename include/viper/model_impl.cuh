@@ -367,6 +367,66 @@ public:
         return true;
     }
 
+    // Load with shared weights from an existing engine (multi-slot CB).
+    // Copies weight pointers; allocates own KV cache + scratch buffers.
+    bool load_shared(const NanbeigeEngine& src) {
+        cfg = src.cfg;
+        kv_slots_ = src.kv_slots_;
+        // Share weight pointers (source owns the GPU memory)
+        layers_ = src.layers_;
+        embed_ = src.embed_;
+        lm_head_q4_ = src.lm_head_q4_;
+        final_norm_ = src.final_norm_;
+        cos_t_ = src.cos_t_;
+        sin_t_ = src.sin_t_;
+
+        const int H = cfg.hidden, HD = cfg.head_dim, I = cfg.intermediate;
+        const int kv_max_seq = cfg.max_seq;
+        const int nQ = cfg.n_heads * HD, nKV = cfg.n_kv_heads * HD;
+        const int MB = max_batch;
+
+        // Per-slot activation buffers (same pool allocation as load)
+        size_t pool_sz = 0;
+        pool_sz += MB * H * 2 + 255; pool_sz += MB * H * 2 + 255;
+        pool_sz += MB * nQ * 2 + 255; pool_sz += MB * nKV * 2 + 255;
+        pool_sz += MB * nKV * 2 + 255; pool_sz += MB * nQ * 2 + 255;
+        pool_sz += MB * I * 2 + 255; pool_sz += MB * I * 2 + 255;
+        pool_sz += MB * cfg.vocab * 2 + 255;
+        pool_sz += MB * 4 + 255; pool_sz += MB * 4 + 255;
+        void* pool = nullptr;
+        if (cudaMalloc(&pool, pool_sz) != cudaSuccess) return false;
+        gpu_allocs_.push_back(pool);
+        auto carve = [&](void** dst, size_t sz) {
+            *dst = pool; pool = (char*)pool + ((sz + 255) & ~(size_t)255);
+        };
+        carve((void**)&x_, (size_t)MB * H * 2);
+        carve((void**)&x_norm_, (size_t)MB * H * 2);
+        carve((void**)&q_, (size_t)MB * nQ * 2);
+        carve((void**)&kb_, (size_t)MB * nKV * 2);
+        carve((void**)&vb_, (size_t)MB * nKV * 2);
+        carve((void**)&attn_, (size_t)MB * nQ * 2);
+        carve((void**)&g_, (size_t)MB * I * 2);
+        carve((void**)&u_, (size_t)MB * I * 2);
+        carve((void**)&logits_, (size_t)MB * cfg.vocab * 2);
+        carve((void**)&d_sample_, (size_t)MB * 4);
+        carve((void**)&d_id_, (size_t)MB * 4);
+
+        // Per-slot KV cache
+        auto alloc = [&](void** d, size_t sz) -> bool {
+            if (cudaMalloc(d, sz) != cudaSuccess) return false;
+            gpu_allocs_.push_back(*d); return true;
+        };
+        size_t slot_bytes = (size_t)kv_max_seq * cfg.n_kv_heads * HD * 2;
+        kv_k_.resize(kv_slots_); kv_v_.resize(kv_slots_);
+        for (int s = 0; s < kv_slots_; ++s) {
+            if (!alloc((void**)&kv_k_[s], slot_bytes)) return false;
+            if (!alloc((void**)&kv_v_[s], slot_bytes)) return false;
+        }
+        std::printf("[viper] shared-weight slot: %d KV slots (%.2f GB)\n",
+                    kv_slots_, 2.0 * kv_slots_ * slot_bytes / 1e9);
+        return true;
+    }
+
     void reset() { seq_len_ = 0; }
     // Expose hidden state for drafter (EAGLE spec decode).
     const __nv_bfloat16* get_hidden() const { return x_; }
