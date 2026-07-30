@@ -37,7 +37,8 @@
  *
  *   This matches production Q4_0 KV cache behavior (llama.cpp). Per-head Q4 is
  *   viable for extreme VRAM savings (128K context on 8GB). If quality needs
- *   improving: switch to per-32-block scales (like Q4_0) instead of per-128-head.
+ * improving: switch to per-32-block scales (like Q4_0) instead of per-128-head.
+ */
 #ifndef VIPER_Q4_KV_CACHE_H
 #define VIPER_Q4_KV_CACHE_H
 

@@ -314,6 +314,119 @@ cudaError_t attn_decode_q4(
         q, k_cache_q4, k_scales, v_cache_q4, v_scales, out, nQ, nKV, D, T_ctx, scale);
     return cudaGetLastError();
 }
+// ---- Q6 KV cache attention variant ----
+// Same online softmax, reads packed 6-bit K/V (4 values per 3 bytes).
+// Two's complement: pack_q6 masks with & 0x3F, unpack sign-extends (>=32 → -64).
+__global__ void attn_decode_q6_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const uint8_t* __restrict__ k_cache_q6,     // [T, nKV, D/4*3] packed Q6
+    const __nv_bfloat16* __restrict__ k_scales,  // [T, nKV] FP16
+    const uint8_t* __restrict__ v_cache_q6,     // [T, nKV, D/4*3]
+    const __nv_bfloat16* __restrict__ v_scales,  // [T, nKV]
+    __nv_bfloat16* __restrict__ out,
+    int nQ, int nKV, int D, int T_ctx, float scale) {
+    const int h = blockIdx.x;
+    if (h >= nQ) return;
+    const int h_kv = (int)((long long)h * nKV / nQ);
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int packed_width = D / 4 * 3;  // bytes per head (96 for D=128)
+
+    __shared__ float q_vec[128];
+    __shared__ float dots[kChunk];
+    __shared__ float red[32];
+    __shared__ float s_scalars[2];
+    if (tid < D) q_vec[tid] = __bfloat162float(q[h * D + tid]);
+    __syncthreads();
+
+    float m_run = -1e30f, l_run = 0.0f, acc = 0.0f;
+    const size_t kv_stride = (size_t)nKV * packed_width;
+    const size_t kv_off = (size_t)h_kv * packed_width;
+
+    for (int c0 = 0; c0 < T_ctx; c0 += kChunk) {
+        const int c_len = min(kChunk, T_ctx - c0);
+        // Dots: unpack 4 Q6 values per 3 bytes, inline dequantize
+        for (int j = tid; j < c_len; j += nthreads) {
+            const uint8_t* k_row = k_cache_q6 + (size_t)(c0 + j) * kv_stride + kv_off;
+            float k_sc = __bfloat162float(k_scales[(size_t)(c0 + j) * nKV + h_kv]);
+            float d = 0.0f;
+            for (int i = 0; i < D; i += 4) {
+                const uint8_t* base = k_row + (i / 4) * 3;
+                int v0 = base[0] & 0x3F;
+                int v1 = ((base[0] >> 6) | (base[1] << 2)) & 0x3F;
+                int v2 = ((base[1] >> 4) | (base[2] << 4)) & 0x3F;
+                int v3 = (base[2] >> 2) & 0x3F;
+                if (v0 >= 32) v0 -= 64;
+                if (v1 >= 32) v1 -= 64;
+                if (v2 >= 32) v2 -= 64;
+                if (v3 >= 32) v3 -= 64;
+                d += q_vec[i]   * (float)v0 * k_sc;
+                d += q_vec[i+1] * (float)v1 * k_sc;
+                d += q_vec[i+2] * (float)v2 * k_sc;
+                d += q_vec[i+3] * (float)v3 * k_sc;
+            }
+            dots[j] = d * scale;
+        }
+        __syncthreads();
+        // Chunk max
+        { float mx = -1e30f;
+          for (int j = tid; j < c_len; j += nthreads) mx = fmaxf(mx, dots[j]);
+          for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, off));
+          if ((tid & 31) == 0) red[tid >> 5] = mx; __syncthreads();
+          if (tid < 32) { float v = (tid < (nthreads >> 5)) ? red[tid] : -1e30f;
+            for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+            if (tid == 0) s_scalars[0] = v; } __syncthreads(); }
+        const float m_new = fmaxf(m_run, s_scalars[0]);
+        const float rescale = __expf(m_run - m_new);
+        // Accumulate V: unpack single Q6 value at tid
+        float l_part = 0.0f;
+        float acc_new = acc * rescale;
+        for (int j = tid; j < c_len; j += nthreads) l_part += __expf(dots[j] - m_new);
+        if (tid < D) {
+            int group = tid >> 2;    // tid / 4
+            int sub = tid & 3;        // tid % 4
+            for (int j = 0; j < c_len; ++j) {
+                const float w = __expf(dots[j] - m_new);
+                const uint8_t* v_row = v_cache_q6 + (size_t)(c0 + j) * kv_stride + kv_off;
+                float v_sc = __bfloat162float(v_scales[(size_t)(c0 + j) * nKV + h_kv]);
+                const uint8_t* base = v_row + group * 3;
+                int v;
+                switch (sub) {
+                    case 0:  v = base[0] & 0x3F; break;
+                    case 1:  v = ((base[0] >> 6) | (base[1] << 2)) & 0x3F; break;
+                    case 2:  v = ((base[1] >> 4) | (base[2] << 4)) & 0x3F; break;
+                    default: v = (base[2] >> 2) & 0x3F; break;
+                }
+                if (v >= 32) v -= 64;
+                acc_new += w * (float)v * v_sc;
+            }
+        }
+        acc = acc_new;
+        { for (int off = 16; off > 0; off >>= 1) l_part += __shfl_down_sync(0xffffffffu, l_part, off);
+          if ((tid & 31) == 0) red[tid >> 5] = l_part; __syncthreads();
+          if (tid < 32) { float v = (tid < (nthreads >> 5)) ? red[tid] : 0.0f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+            if (tid == 0) s_scalars[1] = v; } __syncthreads(); }
+        l_run = l_run * rescale + s_scalars[1];
+        m_run = m_new;
+        __syncthreads();
+    }
+    if (tid < D) out[h * D + tid] = __float2bfloat16(acc / fmaxf(l_run, 1e-30f));
+}
+
+cudaError_t attn_decode_q6(
+    const __nv_bfloat16* q,
+    const uint8_t* k_cache_q6, const __nv_bfloat16* k_scales,
+    const uint8_t* v_cache_q6, const __nv_bfloat16* v_scales,
+    __nv_bfloat16* out,
+    int nQ, int nKV, int D, int T_ctx, float scale,
+    cudaStream_t stream) {
+    if (T_ctx <= 0) { cudaMemsetAsync(out, 0, (size_t)nQ * D * 2, stream); return cudaSuccess; }
+    if (D != 128) return cudaErrorInvalidValue;
+    attn_decode_q6_kernel<<<nQ, 128, 0, stream>>>(
+        q, k_cache_q6, k_scales, v_cache_q6, v_scales, out, nQ, nKV, D, T_ctx, scale);
+    return cudaGetLastError();
+}
 
 // ---- Batch attention with causal masking (for speculative decode) ----
 // Grid: (nQ, M). Each block handles one (head, token) pair.

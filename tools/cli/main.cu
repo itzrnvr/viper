@@ -85,9 +85,10 @@ int main(int argc, char** argv) {
     engine.max_batch = std::max(spec_k + 1, 5);
     engine.cfg.kv_cache_type = cacheType;
     if (cacheType == 1) std::printf("[cli] Q8 KV cache (49%% VRAM savings)\n");
+    else if (cacheType == 2) std::printf("[cli] Q6 KV cache (62.5%% VRAM savings vs BF16)\n");
     else if (cacheType == 3) std::printf("[cli] Q4 KV cache (75%% VRAM savings, enables 128K context)\n");
-    else if (cacheType > 0 && cacheType != 1 && cacheType != 3) {
-        std::fprintf(stderr, "[cli] ERROR: cache type %d not implemented (0=BF16, 1=Q8, 3=Q4)\n", cacheType);
+    else if (cacheType > 0) {
+        std::fprintf(stderr, "[cli] ERROR: cache type %d not implemented (0=BF16, 1=Q8, 2=Q6, 3=Q4)\n", cacheType);
         return 1;
     }
     if (!engine.load(modelp)) { std::fprintf(stderr, "[cli] engine load failed\n"); return 1; }

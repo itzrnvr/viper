@@ -32,6 +32,7 @@
  * LESSON: When adding inter-warp reduction via SWAP, the line immediately AFTER
  * the scale computation (the scale store) is easily eaten. Always verify the
  * store survives by grepping 'scale_row[h] =' after every quantize kernel edit.
+ */
 #ifndef VIPER_Q8_KV_CACHE_H
 #define VIPER_Q8_KV_CACHE_H
 

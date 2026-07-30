@@ -63,6 +63,7 @@
 #include "kernels/ops/swiglu_quantize.h"
 #include "kernels/ops/q8_kv_cache.cuh"
 #include "kernels/ops/q4_kv_cache.cuh"
+#include "kernels/ops/q6_kv_cache.cuh"
 #include "kernels/ops/q8_dequant.cuh"
 
 namespace viper {
@@ -300,6 +301,20 @@ public:
             std::printf("[viper] Q8 KV cache: %d slots (%.2f GB)\n", kv_slots_,
                         (double)kv_slots_ * (q8_data + q8_sc) * 2 / 1e9);
         }
+        if (cfg.kv_cache_type == KV_Q6) {
+            size_t q6_data = (size_t)kv_max_seq * cfg.n_kv_heads * HD / 4 * 3;
+            size_t q6_sc = (size_t)kv_max_seq * cfg.n_kv_heads * sizeof(__nv_bfloat16);
+            q6_k_cache_.resize(kv_slots_); q6_v_cache_.resize(kv_slots_);
+            q6_k_scales_.resize(kv_slots_); q6_v_scales_.resize(kv_slots_);
+            for (int s = 0; s < kv_slots_; ++s) {
+                if (!alloc((void**)&q6_k_cache_[s], q6_data)) return false;
+                if (!alloc((void**)&q6_v_cache_[s], q6_data)) return false;
+                if (!alloc((void**)&q6_k_scales_[s], q6_sc)) return false;
+                if (!alloc((void**)&q6_v_scales_[s], q6_sc)) return false;
+            }
+            std::printf("[viper] Q6 KV cache: %d slots (%.2f GB, 62.5%% savings vs BF16)\n", kv_slots_,
+                        (double)kv_slots_ * (q6_data + q6_sc) * 2 / 1e9);
+        }
         if (cfg.kv_cache_type == KV_Q4) {
             size_t q4_data = (size_t)kv_max_seq * cfg.n_kv_heads * HD / 2;
             size_t q4_sc = (size_t)kv_max_seq * cfg.n_kv_heads * sizeof(__nv_bfloat16);
@@ -503,6 +518,13 @@ private:
                     VK(ops::attn_decode_q8(vb_, q8_k_cache_[slot], q8_k_scales_[slot],
                                             q8_v_cache_[slot], q8_v_scales_[slot], attn_,
                                             nQ, nKVh, HD, pos + 1, attn_scale, s_));
+                } else if (cfg.kv_cache_type == KV_Q6) {
+                    VK(ops::k_to_q6_cache(kv_k_[slot] + (size_t)pos * nKVh * HD,
+                                           q6_k_cache_[slot], q6_k_scales_[slot], pos, nKVh, HD, s_));
+                    VK(ops::v_to_q6_cache(v_cache_ptr, q6_v_cache_[slot], q6_v_scales_[slot], pos, nKVh, HD, s_));
+                    VK(ops::attn_decode_q6(vb_, q6_k_cache_[slot], q6_k_scales_[slot],
+                                            q6_v_cache_[slot], q6_v_scales_[slot], attn_,
+                                            nQ, nKVh, HD, pos + 1, attn_scale, s_));
                 } else if (cfg.kv_cache_type == KV_Q4) {
                     VK(ops::k_to_q4_cache(kv_k_[slot] + (size_t)pos * nKVh * HD,
                                            q4_k_cache_[slot], q4_k_scales_[slot], pos, nKVh, HD, s_));
@@ -554,6 +576,9 @@ private:
     // Q4 KV cache (when kv_cache_type == KV_Q4)
     std::vector<uint8_t*> q4_k_cache_, q4_v_cache_;
     std::vector<__nv_bfloat16*> q4_k_scales_, q4_v_scales_;
+    // Q6 KV cache (when kv_cache_type == KV_Q6)
+    std::vector<uint8_t*> q6_k_cache_, q6_v_cache_;
+    std::vector<__nv_bfloat16*> q6_k_scales_, q6_v_scales_;
     std::vector<GpuLayer> layers_;
     const __nv_bfloat16* embed_ = nullptr;
     GpuLinearQ4 lm_head_q4_;

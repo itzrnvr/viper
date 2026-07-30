@@ -99,9 +99,9 @@ __global__ void kv_bf16_to_q6_kernel(
         // Clamp to [-32, 31]
         q0 = max(-32, min(31, q0)); q1 = max(-32, min(31, q1));
         q2 = max(-32, min(31, q2)); q3 = max(-32, min(31, q3));
-        // Convert to unsigned 6-bit (add 32 for two's complement)
+        // Two's complement: pack_q6 masks with 0x3F, giving true 6-bit signed
         uint8_t b0, b1, b2;
-        pack_q6(q0 + 32, q1 + 32, q2 + 32, q3 + 32, b0, b1, b2);
+        pack_q6(q0, q1, q2, q3, b0, b1, b2);
         out[tid * 3] = b0;
         out[tid * 3 + 1] = b1;
         out[tid * 3 + 2] = b2;
@@ -150,7 +150,7 @@ __global__ void kv_to_q6_cache_kernel(
         int q2 = max(-32, min(31, (int)roundf(__bfloat162float(kv_src[h * HD + base + 2]) * inv_scale)));
         int q3 = max(-32, min(31, (int)roundf(__bfloat162float(kv_src[h * HD + base + 3]) * inv_scale)));
         uint8_t b0, b1, b2;
-        pack_q6(q0 + 32, q1 + 32, q2 + 32, q3 + 32, b0, b1, b2);
+        pack_q6(q0, q1, q2, q3, b0, b1, b2);
         cache_row[tid * 3] = b0;
         cache_row[tid * 3 + 1] = b1;
         cache_row[tid * 3 + 2] = b2;
