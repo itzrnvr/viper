@@ -75,3 +75,4 @@ logs/
 
 # Build outputs that may get generated at runtime
 results/
+artifacts/drafter_output/
