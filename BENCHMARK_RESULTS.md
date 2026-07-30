@@ -35,3 +35,28 @@
 - swiglu+quantize fusion: saves 44 kernel launches
 - Zero-sync fused rope: saves 44 kernel launches
 - Occupancy fix: o_proj 3→6 blocks/SM, down_proj 2→6 blocks/SM
+
+### Batched Prefill
+
+| Mode | TTFT (50 tokens) | Decode tok/s |
+|---|---|---|
+| Sequential (batch=1) | 0.84s | 52.4 |
+| Batched (batch=8) | 0.52s | 57.8 |
+
+Batched prefill reduces TTFT by 38%.
+
+### All Code Deliverables
+
+| Feature | File | Status |
+|---|---|---|
+| Flash decode (online softmax) | kernels/ops/flash_decode.cuh | Written, needs wiring |
+| Q8 KV cache | kernels/ops/q8_kv_cache.cuh | Written, needs wiring |
+| Q6 KV cache | kernels/ops/q6_kv_cache.cuh | Written, needs wiring |
+| Q4 KV cache | kernels/ops/q4_kv_cache.cuh | Written, needs wiring |
+| TurboQuant KV | kernels/ops/turboquant_kv.cuh | Written, needs wiring |
+| Continuous batching | tools/serve/main_cb.cpp | Written |
+| lm_head pruning | model_impl.cuh | Wired, tested |
+| Batched prefill | main.cu | Wired, tested |
+| Weight interleaving | tools/convert/interleave_weights.py | Written, marginal benefit |
+| Quality harness | tools/bench/quality_harness.py | Written |
+| DP4A L1-cached engine | dp4a_smem_kernel.cu + rmsnorm_quantize.cu | Built, VERIFIED |
