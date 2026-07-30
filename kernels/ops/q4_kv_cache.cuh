@@ -68,6 +68,8 @@ __global__ void kv_to_q4_cache_kernel(
     __syncthreads();
 
     float scale = fmaxf(q4_s_gmax / 7.0f, 1e-8f);
+    if (tid == 0) scale_row[h] = __float2bfloat16(scale);
+    __syncthreads();
 
     float inv_scale = 1.0f / scale;
     // Pack 2 values per byte. Each thread handles HD/(2*blockDim.x) bytes.
