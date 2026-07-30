@@ -52,6 +52,7 @@
 #include "kernels/ops/swiglu_quantize.h"
 #include "kernels/ops/q8_kv_cache.cuh"
 #include "kernels/ops/q4_kv_cache.cuh"
+#include "kernels/ops/q8_dequant.cuh"
 
 namespace viper {
 
@@ -482,8 +483,8 @@ private:
                 VK(ops::dp4a_smem_gemv(lw.q.packed, lw.q.scales, d_q8_, d_q8s_, q_, 1, lw.q.out_f, lw.q.in_f, s_));
                 VK(ops::dp4a_smem_gemv_fused2(lw.k.packed, lw.k.scales, lw.v.packed, lw.v.scales,
                                                d_q8_, d_q8s_, kb_, v_cache_ptr, 1, lw.k.out_f, lw.k.in_f, s_));
-                if (prof && l == 0 && loop == 0) cudaEventRecord(ev[2], s_);
                 VK(ops::rope_q_k_fused(q_, vb_, kb_, kv_k_[slot], pos, nKVh, nQ, nKVh, cos_pos, sin_pos, HD, s_));
+                if (prof && l == 0 && loop == 0) cudaEventRecord(ev[2], s_);
                 if (cfg.kv_cache_type == KV_Q8) {
                     VK(ops::k_to_q8_cache(kv_k_[slot] + (size_t)pos * nKVh * HD,
                                            q8_k_cache_[slot], q8_k_scales_[slot], pos, nKVh, HD, s_));

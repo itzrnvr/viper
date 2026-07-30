@@ -76,8 +76,20 @@ __global__ void k_to_q8_cache_kernel(
         gmax = fmaxf(gmax, fabsf(__bfloat162float(k_src[h * HD + d])));
     for (int off = 16; off > 0; off >>= 1)
         gmax = fmaxf(gmax, __shfl_xor_sync(0xffffffff, gmax, off));
+    // Inter-warp reduction (CRITICAL: was missing, only warp 0's max was used)
+    __shared__ float warp_max[8];
+    const int wid = tid >> 5, lid = tid & 31;
+    if (lid == 0) warp_max[wid] = gmax;
+    __syncthreads();
+    __shared__ float s_gmax;
+    if (tid == 0) {
+        float m = warp_max[0];
+        for (int i = 1; i < (nthreads >> 5); ++i) m = fmaxf(m, warp_max[i]);
+        s_gmax = m;
+    }
+    __syncthreads();
 
-    float scale = fmaxf(gmax / 127.0f, 1e-8f);
+    float scale = fmaxf(s_gmax / 127.0f, 1e-8f);
     if (tid == 0) scale_row[h] = __float2bfloat16(scale);
     __syncthreads();
 
@@ -106,8 +118,19 @@ __global__ void v_to_q8_cache_kernel(
         gmax = fmaxf(gmax, fabsf(__bfloat162float(v_src[h * HD + d])));
     for (int off = 16; off > 0; off >>= 1)
         gmax = fmaxf(gmax, __shfl_xor_sync(0xffffffff, gmax, off));
+    __shared__ float vwarp_max[8];
+    const int vwid = tid >> 5, vlid = tid & 31;
+    if (vlid == 0) vwarp_max[vwid] = gmax;
+    __syncthreads();
+    __shared__ float vs_gmax;
+    if (tid == 0) {
+        float m = vwarp_max[0];
+        for (int i = 1; i < (nthreads >> 5); ++i) m = fmaxf(m, vwarp_max[i]);
+        vs_gmax = m;
+    }
+    __syncthreads();
 
-    float scale = fmaxf(gmax / 127.0f, 1e-8f);
+    float scale = fmaxf(vs_gmax / 127.0f, 1e-8f);
     if (tid == 0) scale_row[h] = __float2bfloat16(scale);
     __syncthreads();
 

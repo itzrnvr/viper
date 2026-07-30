@@ -50,16 +50,24 @@ __global__ void kv_to_q4_cache_kernel(
     uint8_t* cache_row = kv_cache + (size_t)pos * nKV * (HD / 2) + (size_t)h * (HD / 2);
     __nv_bfloat16* scale_row = kv_scales + (size_t)pos * nKV;
 
-    // Find per-head max
     float gmax = 0.f;
     for (int d = tid; d < HD; d += blockDim.x)
         gmax = fmaxf(gmax, fabsf(__bfloat162float(kv_src[h * HD + d])));
     for (int off = 16; off > 0; off >>= 1)
         gmax = fmaxf(gmax, __shfl_xor_sync(0xffffffff, gmax, off));
-
-    float scale = fmaxf(gmax / 7.0f, 1e-8f);  // 4-bit signed: range -8..7
-    if (tid == 0) scale_row[h] = __float2bfloat16(scale);
+    __shared__ float q4_warp_max[8];
+    const int wid = tid >> 5, lid = tid & 31;
+    if (lid == 0) q4_warp_max[wid] = gmax;
     __syncthreads();
+    __shared__ float q4_s_gmax;
+    if (tid == 0) {
+        float m = q4_warp_max[0];
+        for (int i = 1; i < (blockDim.x >> 5); ++i) m = fmaxf(m, q4_warp_max[i]);
+        q4_s_gmax = m;
+    }
+    __syncthreads();
+
+    float scale = fmaxf(q4_s_gmax / 7.0f, 1e-8f);
 
     float inv_scale = 1.0f / scale;
     // Pack 2 values per byte. Each thread handles HD/(2*blockDim.x) bytes.

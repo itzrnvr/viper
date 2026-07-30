@@ -63,6 +63,7 @@ struct NgramCache {
 };
 
 int main(int argc, char** argv) {
+    std::printf("[cli] BUILT %s %s\n", __DATE__, __TIME__);
     std::string modelp = argval(argc, argv, "--model", "D:/dev/viper/artifacts/Nanbeige4.2-3B.viper");
     std::string vocabp = argval(argc, argv, "--vocab", "D:/dev/viper/artifacts/vocab.bin");
     std::string drafterp = argval(argc, argv, "--drafter", "");
