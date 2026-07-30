@@ -426,7 +426,7 @@ private:
         static int prof_count = 0;
         static cudaEvent_t ev[8];
         static bool ev_init = false;
-        const bool prof = want_logits && (++prof_count % 100 == 0);
+        const bool prof = false;  // disabled: prevents cudaEvent crash at step 100
         if (prof && !ev_init) { for (int i=0;i<8;i++) cudaEventCreate(&ev[i]); ev_init=true; }
         if (prof) cudaEventRecord(ev[0], s_);
         VK(cudaMemcpyAsync(d_id_, &token, 4, cudaMemcpyHostToDevice, s_));
