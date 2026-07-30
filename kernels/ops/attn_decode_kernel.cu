@@ -255,9 +255,11 @@ __global__ void attn_decode_q4_kernel(
         const int c_len = min(kChunk, T_ctx - c0);
         for (int j = tid; j < c_len; j += nthreads) {
             const uint8_t* k_row = k_cache_q4 + (size_t)(c0 + j) * kv_stride + kv_off;
-            float k_sc = __bfloat162float(k_scales[(size_t)(c0 + j) * nKV + h_kv]);
             float d = 0.0f;
+            const int nBlocks = D / 32;
             for (int i = 0; i < D; i += 2) {
+                int blk = i / 32;
+                float k_sc = __bfloat162float(k_scales[(size_t)(c0 + j) * nKV * nBlocks + h_kv * nBlocks + blk]);
                 uint8_t packed = k_row[i / 2];
                 d += q_vec[i] * (float)((packed & 0xF) - 8) * k_sc;
                 d += q_vec[i + 1] * (float)(((packed >> 4) & 0xF) - 8) * k_sc;
@@ -281,7 +283,9 @@ __global__ void attn_decode_q4_kernel(
             for (int j = 0; j < c_len; ++j) {
                 const float w = __expf(dots[j] - m_new);
                 const uint8_t* v_row = v_cache_q4 + (size_t)(c0 + j) * kv_stride + kv_off;
-                float v_sc = __bfloat162float(v_scales[(size_t)(c0 + j) * nKV + h_kv]);
+                int blk = tid / 32;
+                int nBlocks = D / 32;
+                float v_sc = __bfloat162float(v_scales[(size_t)(c0 + j) * nKV * nBlocks + h_kv * nBlocks + blk]);
                 int v0 = (v_row[tid / 2] & 0xF) - 8;
                 int v1 = ((v_row[tid / 2] >> 4) & 0xF) - 8;
                 float val = (tid & 1) ? (float)v1 * v_sc : (float)v0 * v_sc;

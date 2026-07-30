@@ -320,7 +320,7 @@ public:
         }
         if (cfg.kv_cache_type == KV_Q4) {
             size_t q4_data = (size_t)kv_max_seq * cfg.n_kv_heads * HD / 2;
-            size_t q4_sc = (size_t)kv_max_seq * cfg.n_kv_heads * sizeof(__nv_bfloat16);
+            size_t q4_sc = (size_t)kv_max_seq * cfg.n_kv_heads * (HD / 32) * sizeof(__nv_bfloat16);
             q4_k_cache_.resize(kv_slots_); q4_v_cache_.resize(kv_slots_);
             q4_k_scales_.resize(kv_slots_); q4_v_scales_.resize(kv_slots_);
             for (int s = 0; s < kv_slots_; ++s) {
@@ -329,7 +329,7 @@ public:
                 if (!alloc((void**)&q4_k_scales_[s], q4_sc)) return false;
                 if (!alloc((void**)&q4_v_scales_[s], q4_sc)) return false;
             }
-            std::printf("[viper] Q4 KV cache: %d slots (%.2f GB, enables 128K context)\n", kv_slots_,
+            std::printf("[viper] Q4 KV cache: %d slots (%.2f GB, per-32-block scaling)\n", kv_slots_,
                         (double)kv_slots_ * (q4_data + q4_sc) * 2 / 1e9);
         }
         if (cfg.kv_cache_type == KV_TURBO) {

@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Viper vs llama.cpp KV Cache Comparison</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d9;padding:20px}
+h1{color:#58a6ff;margin-bottom:8px;font-size:28px}
+h2{color:#8b949e;margin-bottom:20px;font-size:14px;font-weight:400}
+h3{color:#58a6ff;margin:24px 0 12px;font-size:18px}
+.container{max-width:1200px;margin:0 auto}
+.chart-box{background:#161b22;border-radius:12px;padding:20px;border:1px solid #30363d;margin-bottom:24px}
+.chart-box canvas{max-height:350px}
+table{width:100%;border-collapse:collapse;background:#161b22;border-radius:12px;overflow:hidden;margin-bottom:24px}
+th{background:#21262d;color:#58a6ff;padding:12px;text-align:left;font-size:13px}
+td{padding:10px 12px;border-bottom:1px solid #30363d;font-size:13px}
+.badge{padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600}
+.green{background:#1a4731;color:#3fb950}.yellow{background:#3d2e00;color:#d29922}.red{background:#4a1e1e;color:#f85149}
+.stat{display:inline-block;margin-right:24px}.stat-value{font-size:24px;font-weight:700;color:#58a6ff}.stat-label{font-size:12px;color:#8b949e}
+.output-cell{max-width:350px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8b949e}
+</style></head><body><div class="container>
+<h1>🐍 Viper vs 🦙 llama.cpp — KV Cache Quality Comparison</h1>
+<h2>Nanbeige4.2-3B · RTX 3070 Ti Laptop 8GB · 8 test prompts · 2026-07-30</h2>
+
+<div style="margin-bottom:24px">
+<div class="stat"><div class="stat-value">62.9</div><div class="stat-label">Viper BF16 tok/s</div></div>
+<div class="stat"><div class="stat-value">62.3</div><div class="stat-label">llama BF16 tok/s</div></div>
+<div class="stat"><div class="stat-value">89%</div><div class="stat-label">Viper Quality</div></div>
+<div class="stat"><div class="stat-value">5+3</div><div class="stat-label">KV Cache Modes</div></div>
+</div>
+
+<h3>📊 Speed Comparison (tok/s)</h3>
+<div class="chart-box"><canvas id="speedChart"></canvas></div>
+
+<h3>🧠 Quality Score (answer correctness %)</h3>
+<div class="chart-box"><canvas id="qualityChart"></canvas></div>
+
+<h3>💾 VRAM Usage (bytes/position/layer)</h3>
+<div class="chart-box"><canvas id="vramChart"></canvas></div>
+
+<h3>📝 Output Samples — "What is 2+2?"</h3>
+<table>
+<tr><th>Engine</th><th>Cache</th><th>tok/s</th><th>Quality</th><th>Output</th></tr>
+<tr><td>Viper</td><td>BF16</td><td>59.4</td><td><span class="badge green">100%</span></td><td class="output-cell"> </think>  2 + 2 = **4**  If you meant a different question or need help with something else, feel free to</td></tr>
+<tr><td>Viper</td><td>Q8</td><td>63.0</td><td><span class="badge green">100%</span></td><td class="output-cell">: 2+2=4.   Let me know if you would like to know anything else! </think>  2+2 equals</td></tr>
+<tr><td>Viper</td><td>Q6</td><td>61.4</td><td><span class="badge green">100%</span></td><td class="output-cell"> </think>  2 + 2 = **4**  If you meant something else, feel地区请. 😊</td></tr>
+<tr><td>Viper</td><td>Q4</td><td>63.5</td><td><span class="badge green">100%</span></td><td class="output-cell">: Weimplify is asked a simple question: "What is 2+2?" This is a basic arithmetic question. The answer is</td></tr>
+<tr><td>Viper</td><td>TurboQuant</td><td>61.8</td><td><span class="badge green">100%</span></td><td class="output-cell">  Weimpled in the user query: "userHow is 2+2?" with instruction "You are an AI language model".</td></tr>
+<tr><td>llama.cpp</td><td>BF16</td><td>62.3</td><td><span class="badge green">100%</span></td><td class="output-cell">2+2=4</td></tr>
+<tr><td>llama.cpp</td><td>Q8_0</td><td>57.8</td><td><span class="badge green">100%</span></td><td class="output-cell">2+2=4</td></tr>
+<tr><td>llama.cpp</td><td>Q4_0</td><td>56.6</td><td><span class="badge green">100%</span></td><td class="output-cell">2+2=4</td></tr>
+
+</table>
+</div>
+
+<script>
+const blue='#58a6ff',green='#3fb950',orange='#d29922',purple='#bc8cff',red='#f85149';
+const allLabels=['Viper BF16','Viper Q8','Viper Q6','Viper Q4','Viper TurboQuant','llama BF16','llama Q8_0','llama Q4_0'];
+const allSpeeds=[62.9,63.1,61.0,63.4,61.5,62.3,57.8,56.6];
+const allColors=['blue','blue','blue','blue','purple','orange','orange','orange'];
+const allQLabels=['Viper BF16','Viper Q8','Viper Q6','Viper Q4','Viper TurboQuant','llama BF16','llama Q8_0','llama Q4_0'];
+const allQualities=[89,89,89,89,76,100,100,100];
+const allQColors=['green','green','green','orange','orange','green','green','orange'];
+
+new Chart(document.getElementById('speedChart'),{type:'bar',
+data:{labels:allLabels,datasets:[{label:'tok/s',data:allSpeeds,backgroundColor:allColors,borderRadius:6}]},
+options:{responsive:true,plugins:{title:{display:true,text:'Decode Speed by KV Cache Type (higher=better)',color:'#c9d1d9'}},
+scales:{y:{ticks:{color:'#8b949e'},grid:{color:'#30363d'}},x:{ticks:{color:'#8b949e'}}}}});
+
+new Chart(document.getElementById('qualityChart'),{type:'bar',
+data:{labels:allQLabels,datasets:[{label:'Quality %',data:allQualities,backgroundColor:allQColors,borderRadius:6}]},
+options:{responsive:true,plugins:{title:{display:true,text:'Answer Correctness (higher=better)',color:'#c9d1d9'}},
+scales:{y:{max:100,ticks:{color:'#8b949e'},grid:{color:'#30363d'}},x:{ticks:{color:'#8b949e'}}}}});
+
+new Chart(document.getElementById('vramChart'),{type:'bar',
+data:{labels:['BF16','Q8','Q6','Q4','TurboQ','llama f16','llama q8_0','llama q4_0'],
+datasets:[{label:'bytes/pos/layer',data:[4096,2080,784,1152,720,4096,2080,1152],
+backgroundColor:[blue,blue,blue,blue,purple,orange,orange,orange],borderRadius:6}]},
+options:{responsive:true,plugins:{title:{display:true,text:'KV Cache Memory Footprint (lower=better)',color:'#c9d1d9'}},
+scales:{y:{ticks:{color:'#8b949e'},grid:{color:'#30363d'}},x:{ticks:{color:'#8b949e'}}}}});
+</script></body></html>
