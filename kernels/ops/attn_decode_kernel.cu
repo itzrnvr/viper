@@ -222,6 +222,99 @@ cudaError_t attn_decode_q8(
     return cudaGetLastError();
 }
 
+// ---- Q4 KV cache attention variant ----
+// Same flash-style online softmax, reads packed 4-bit K/V (2 values per byte).
+// Offset encoding: stored = value + 8 (range 0-15 for values -8..7).
+__global__ void attn_decode_q4_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const uint8_t* __restrict__ k_cache_q4,     // [T, nKV, D/2] packed Q4
+    const __nv_bfloat16* __restrict__ k_scales,  // [T, nKV] FP16
+    const uint8_t* __restrict__ v_cache_q4,     // [T, nKV, D/2]
+    const __nv_bfloat16* __restrict__ v_scales,  // [T, nKV]
+    __nv_bfloat16* __restrict__ out,
+    int nQ, int nKV, int D, int T_ctx, float scale) {
+    const int h = blockIdx.x;
+    if (h >= nQ) return;
+    const int h_kv = (int)((long long)h * nKV / nQ);
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int halfD = D / 2;
+
+    __shared__ float q_vec[128];
+    __shared__ float dots[kChunk];
+    __shared__ float red[32];
+    __shared__ float s_scalars[2];
+    if (tid < D) q_vec[tid] = __bfloat162float(q[h * D + tid]);
+    __syncthreads();
+
+    float m_run = -1e30f, l_run = 0.0f, acc = 0.0f;
+    const size_t kv_stride = (size_t)nKV * halfD;
+    const size_t kv_off = (size_t)h_kv * halfD;
+
+    for (int c0 = 0; c0 < T_ctx; c0 += kChunk) {
+        const int c_len = min(kChunk, T_ctx - c0);
+        for (int j = tid; j < c_len; j += nthreads) {
+            const uint8_t* k_row = k_cache_q4 + (size_t)(c0 + j) * kv_stride + kv_off;
+            float k_sc = __bfloat162float(k_scales[(size_t)(c0 + j) * nKV + h_kv]);
+            float d = 0.0f;
+            for (int i = 0; i < D; i += 2) {
+                uint8_t packed = k_row[i / 2];
+                d += q_vec[i] * (float)((packed & 0xF) - 8) * k_sc;
+                d += q_vec[i + 1] * (float)(((packed >> 4) & 0xF) - 8) * k_sc;
+            }
+            dots[j] = d * scale;
+        }
+        __syncthreads();
+        { float mx = -1e30f;
+          for (int j = tid; j < c_len; j += nthreads) mx = fmaxf(mx, dots[j]);
+          for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, off));
+          if ((tid & 31) == 0) red[tid >> 5] = mx; __syncthreads();
+          if (tid < 32) { float v = (tid < (nthreads >> 5)) ? red[tid] : -1e30f;
+            for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+            if (tid == 0) s_scalars[0] = v; } __syncthreads(); }
+        const float m_new = fmaxf(m_run, s_scalars[0]);
+        const float rescale = __expf(m_run - m_new);
+        float l_part = 0.0f;
+        float acc_new = acc * rescale;
+        for (int j = tid; j < c_len; j += nthreads) l_part += __expf(dots[j] - m_new);
+        if (tid < D) {
+            for (int j = 0; j < c_len; ++j) {
+                const float w = __expf(dots[j] - m_new);
+                const uint8_t* v_row = v_cache_q4 + (size_t)(c0 + j) * kv_stride + kv_off;
+                float v_sc = __bfloat162float(v_scales[(size_t)(c0 + j) * nKV + h_kv]);
+                int v0 = (v_row[tid / 2] & 0xF) - 8;
+                int v1 = ((v_row[tid / 2] >> 4) & 0xF) - 8;
+                float val = (tid & 1) ? (float)v1 * v_sc : (float)v0 * v_sc;
+                acc_new += w * val;
+            }
+        }
+        acc = acc_new;
+        { for (int off = 16; off > 0; off >>= 1) l_part += __shfl_down_sync(0xffffffffu, l_part, off);
+          if ((tid & 31) == 0) red[tid >> 5] = l_part; __syncthreads();
+          if (tid < 32) { float v = (tid < (nthreads >> 5)) ? red[tid] : 0.0f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+            if (tid == 0) s_scalars[1] = v; } __syncthreads(); }
+        l_run = l_run * rescale + s_scalars[1];
+        m_run = m_new;
+        __syncthreads();
+    }
+    if (tid < D) out[h * D + tid] = __float2bfloat16(acc / fmaxf(l_run, 1e-30f));
+}
+
+cudaError_t attn_decode_q4(
+    const __nv_bfloat16* q,
+    const uint8_t* k_cache_q4, const __nv_bfloat16* k_scales,
+    const uint8_t* v_cache_q4, const __nv_bfloat16* v_scales,
+    __nv_bfloat16* out,
+    int nQ, int nKV, int D, int T_ctx, float scale,
+    cudaStream_t stream) {
+    if (T_ctx <= 0) { cudaMemsetAsync(out, 0, (size_t)nQ * D * 2, stream); return cudaSuccess; }
+    if (D != 128) return cudaErrorInvalidValue;
+    attn_decode_q4_kernel<<<nQ, 128, 0, stream>>>(
+        q, k_cache_q4, k_scales, v_cache_q4, v_scales, out, nQ, nKV, D, T_ctx, scale);
+    return cudaGetLastError();
+}
+
 // ---- Batch attention with causal masking (for speculative decode) ----
 // Grid: (nQ, M). Each block handles one (head, token) pair.
 // Token m attends to positions 0..pos_start+m (causal).
