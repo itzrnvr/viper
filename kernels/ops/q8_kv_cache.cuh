@@ -14,7 +14,24 @@
  *
  * Quality: near-lossless. INT8 with per-head FP16 scale preserves
  * attention accuracy to ~1e-3 relative error.
- */
+ *
+ * BUG HISTORY (2026-07-30):
+ *   1. Inter-warp reduction missing: with 128 threads (4 warps), only warp 0's
+ *      partial max was used as the scale. Dims 32-127 were quantized with their
+ *      warp-local max but dequantized with warp 0's scale → wrong magnitudes.
+ *      Fix: shared-memory inter-warp reduction before computing scale.
+ *
+ *   2. K scale store deleted by SWAP edit: the inter-warp SWAP consumed
+ *      'if (tid==0) scale_row[h] = __float2bfloat16(scale)' from k_to_q8_cache
+ *      but NOT from v_to_q8_cache. K scales were uninitialized → garbage dots.
+ *      Fix: re-add the store line. V kernel already had it.
+ *
+ * Both bugs together produced complete garbage (许许多/不仅如此) for prompts >7 tokens.
+ * With both fixed: Q8 matches BF16 quality at 57.7 tok/s (vs BF16 63.4 tok/s).
+ *
+ * LESSON: When adding inter-warp reduction via SWAP, the line immediately AFTER
+ * the scale computation (the scale store) is easily eaten. Always verify the
+ * store survives by grepping 'scale_row[h] =' after every quantize kernel edit.
 #ifndef VIPER_Q8_KV_CACHE_H
 #define VIPER_Q8_KV_CACHE_H
 

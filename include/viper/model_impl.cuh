@@ -17,6 +17,17 @@
 //   token = argmax(logits)
 //
 // Safety: VRAM headroom check before weight upload; all CUDA calls checked.
+//
+// BUG HISTORY (2026-07-30):
+//   rope_q_k_fused call was accidentally deleted by a SWAP edit that replaced
+//   lines starting at what was the rope call. Without RoPE: Q had no positional
+//   encoding, K was never written to the KV cache, and vb_ (rotated Q) was
+//   uninitialized. This broke ALL cache types — BF16, Q8, and Q4 all produced
+//   repetitive garbage (许许多/不仅如此/22222). The deletion survived multiple
+//   code read-backs because the surrounding lines (prof event, cache-type branch)
+//   looked intact. LESSON: after any SWAP near the attention section, grep for
+//   'rope_q_k_fused' to confirm it survives — it is load-bearing for every
+//   cache type, not just quantized ones.
 #pragma once
 
 #ifdef _WIN32

@@ -24,7 +24,20 @@
  *
  * Quality: 4-bit KV cache has measurable attention quality loss.
  * TurboQuant addresses this by using Q8 for sensitive heads, Q4 for others.
- */
+ *
+ * BUG HISTORY (2026-07-30):
+ *   Same two bugs as Q8 (inter-warp reduction missing + scale store eaten by
+ *   SWAP). The scale_store deletion was the THIRD instance of the same pattern:
+ *   SWAP edits eating the line after scale computation. With correct scales,
+ *   Q4 changes from random garbage to degraded-but-coherent output.
+ *
+ *   Verified with --cache-type 3, prompt "What is 2+2?":
+ *     Before scale fix: '?/ico number开工th舍ip...' (random)
+ *     After scale fix:  '<think>{"question": "What is 2' (coherent, degraded)
+ *
+ *   This matches production Q4_0 KV cache behavior (llama.cpp). Per-head Q4 is
+ *   viable for extreme VRAM savings (128K context on 8GB). If quality needs
+ *   improving: switch to per-32-block scales (like Q4_0) instead of per-128-head.
 #ifndef VIPER_Q4_KV_CACHE_H
 #define VIPER_Q4_KV_CACHE_H
 
