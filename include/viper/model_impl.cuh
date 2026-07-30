@@ -51,6 +51,7 @@
 #include "kernels/ops/dp4a_smem_kernel.h"
 #include "kernels/ops/swiglu_quantize.h"
 #include "kernels/ops/q8_kv_cache.cuh"
+#include "kernels/ops/q4_kv_cache.cuh"
 
 namespace viper {
 
@@ -287,6 +288,20 @@ public:
             std::printf("[viper] Q8 KV cache: %d slots (%.2f GB)\n", kv_slots_,
                         (double)kv_slots_ * (q8_data + q8_sc) * 2 / 1e9);
         }
+        if (cfg.kv_cache_type == KV_Q4) {
+            size_t q4_data = (size_t)kv_max_seq * cfg.n_kv_heads * HD / 2;
+            size_t q4_sc = (size_t)kv_max_seq * cfg.n_kv_heads * sizeof(__nv_bfloat16);
+            q4_k_cache_.resize(kv_slots_); q4_v_cache_.resize(kv_slots_);
+            q4_k_scales_.resize(kv_slots_); q4_v_scales_.resize(kv_slots_);
+            for (int s = 0; s < kv_slots_; ++s) {
+                if (!alloc((void**)&q4_k_cache_[s], q4_data)) return false;
+                if (!alloc((void**)&q4_v_cache_[s], q4_data)) return false;
+                if (!alloc((void**)&q4_k_scales_[s], q4_sc)) return false;
+                if (!alloc((void**)&q4_v_scales_[s], q4_sc)) return false;
+            }
+            std::printf("[viper] Q4 KV cache: %d slots (%.2f GB, enables 128K context)\n", kv_slots_,
+                        (double)kv_slots_ * (q4_data + q4_sc) * 2 / 1e9);
+        }
 
         // Device-side copies for persistent kernel.
         if (!alloc((void**)&d_layers_, sizeof(GpuLayer) * cfg.n_layers)) return false;
@@ -476,6 +491,13 @@ private:
                     VK(ops::attn_decode_q8(vb_, q8_k_cache_[slot], q8_k_scales_[slot],
                                             q8_v_cache_[slot], q8_v_scales_[slot], attn_,
                                             nQ, nKVh, HD, pos + 1, attn_scale, s_));
+                } else if (cfg.kv_cache_type == KV_Q4) {
+                    VK(ops::k_to_q4_cache(kv_k_[slot] + (size_t)pos * nKVh * HD,
+                                           q4_k_cache_[slot], q4_k_scales_[slot], pos, nKVh, HD, s_));
+                    VK(ops::v_to_q4_cache(v_cache_ptr, q4_v_cache_[slot], q4_v_scales_[slot], pos, nKVh, HD, s_));
+                    VK(ops::attn_decode_q4(vb_, q4_k_cache_[slot], q4_k_scales_[slot],
+                                            q4_v_cache_[slot], q4_v_scales_[slot], attn_,
+                                            nQ, nKVh, HD, pos + 1, attn_scale, s_));
                 } else {
                     VK(ops::attn_decode_bf16(vb_, kv_k_[slot], kv_v_[slot], attn_,
                                              nQ, nKVh, HD, pos + 1, attn_scale, s_));
@@ -516,7 +538,10 @@ private:
         return true;
     }
 
-    ModelConfig cfg_;
+    std::vector<__nv_bfloat16*> q8_k_scales_, q8_v_scales_;
+    // Q4 KV cache (when kv_cache_type == KV_Q4)
+    std::vector<uint8_t*> q4_k_cache_, q4_v_cache_;
+    std::vector<__nv_bfloat16*> q4_k_scales_, q4_v_scales_;
     std::vector<GpuLayer> layers_;
     const __nv_bfloat16* embed_ = nullptr;
     GpuLinearQ4 lm_head_q4_;
@@ -541,7 +566,6 @@ private:
     float* d_q8s_ = nullptr;
     // Q8 KV cache (allocated when kv_cache_type == KV_Q8)
     std::vector<int8_t*> q8_k_cache_, q8_v_cache_;
-    std::vector<__nv_bfloat16*> q8_k_scales_, q8_v_scales_;
 
     // ---- CUDA Graph state ----
     cudaStream_t s_ = 0;           // custom stream (0 = default)
