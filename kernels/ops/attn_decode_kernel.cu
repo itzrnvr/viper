@@ -483,15 +483,20 @@ __global__ void attn_decode_turbo_kernel(
         // Dots: per-head format dispatch (constant per block)
         for (int j = tid; j < c_len; j += nthreads) {
             const uint8_t* k_row = k_cache + (size_t)(c0 + j) * total_offset + head_off;
-            float k_sc = __bfloat162float(k_scales[(size_t)(c0 + j) * nKV + h_kv]);; if (!isfinite(k_sc)) k_sc = 0.0f;
+            const int nBlk = D / 32;
             float d = 0.0f;
             if (fmt == 0) {
-                // Q8: direct int8 reads
-                for (int i = 0; i < D; ++i)
+                // Q8: per-block scale
+                for (int i = 0; i < D; ++i) {
+                    int blk = i / 32;
+                    float k_sc = __bfloat162float(k_scales[(size_t)(c0 + j) * nKV * nBlk + h_kv * nBlk + blk]); if (!isfinite(k_sc)) k_sc = 0.0f;
                     d += q_vec[i] * ((float)(int8_t)k_row[i] * k_sc);
+                }
             } else if (fmt == 1) {
-                // Q6: 4 values per 3 bytes, two's complement
+                // Q6: per-block scale
                 for (int i = 0; i < D; i += 4) {
+                    int blk = i / 32;
+                    float k_sc = __bfloat162float(k_scales[(size_t)(c0 + j) * nKV * nBlk + h_kv * nBlk + blk]); if (!isfinite(k_sc)) k_sc = 0.0f;
                     const uint8_t* base = k_row + (i/4)*3;
                     int v0 = base[0] & 0x3F;
                     int v1 = ((base[0]>>6)|(base[1]<<2)) & 0x3F;
@@ -503,8 +508,10 @@ __global__ void attn_decode_turbo_kernel(
                        + q_vec[i+2]*v2*k_sc + q_vec[i+3]*v3*k_sc;
                 }
             } else {
-                // Q4: 2 values per byte, offset encoding
+                // Q4: per-block scale
                 for (int i = 0; i < D; i += 2) {
+                    int blk = i / 32;
+                    float k_sc = __bfloat162float(k_scales[(size_t)(c0 + j) * nKV * nBlk + h_kv * nBlk + blk]); if (!isfinite(k_sc)) k_sc = 0.0f;
                     uint8_t packed = k_row[i/2];
                     d += q_vec[i] * (float)((packed & 0xF) - 8) * k_sc;
                     d += q_vec[i+1] * (float)(((packed>>4) & 0xF) - 8) * k_sc;
@@ -532,7 +539,8 @@ __global__ void attn_decode_turbo_kernel(
             for (int j = 0; j < c_len; ++j) {
                 const float w = __expf(dots[j] - m_new);
                 const uint8_t* v_row = v_cache + (size_t)(c0 + j) * total_offset + head_off;
-                float v_sc = __bfloat162float(v_scales[(size_t)(c0 + j) * nKV + h_kv]);; if (!isfinite(v_sc)) v_sc = 0.0f;
+                int vblk = tid / 32; int vnB = D / 32;
+                float v_sc = __bfloat162float(v_scales[(size_t)(c0 + j) * nKV * vnB + h_kv * vnB + vblk]);; if (!isfinite(v_sc)) v_sc = 0.0f;
                 float val;
                 if (fmt == 0) {
                     val = (float)(int8_t)v_row[tid] * v_sc;

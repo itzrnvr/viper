@@ -336,7 +336,7 @@ public:
             ops::TurboQuantConfig tq_cfg;
             int tq_total = tq_cfg.total_bytes(HD);
             size_t tq_data = (size_t)kv_max_seq * tq_total;
-            size_t tq_sc = (size_t)kv_max_seq * cfg.n_kv_heads * sizeof(__nv_bfloat16);
+            size_t tq_sc = (size_t)kv_max_seq * cfg.n_kv_heads * (HD / 32) * sizeof(__nv_bfloat16);
             turbo_k_cache_.resize(kv_slots_); turbo_v_cache_.resize(kv_slots_);
             turbo_k_scales_.resize(kv_slots_); turbo_v_scales_.resize(kv_slots_);
             for (int s = 0; s < kv_slots_; ++s) {
