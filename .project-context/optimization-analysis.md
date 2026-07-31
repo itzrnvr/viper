@@ -82,18 +82,32 @@ The current layout is optimal for this GEMV access pattern.
 
 ---
 
-## Summary
+## Summary (CORRECTED 2026-07-31)
 
-| Optimization | Status | Reason |
-|-------------|--------|--------|
-| Flash attention | ✅ Wired + verified | --flash-attn flag |
-| Q8 KV cache | ✅ Verified correct | 49% VRAM savings |
-| Q6 KV cache | ✅ Verified correct | 62.5% VRAM savings |
-| Q4 KV cache | ✅ Working | 75% savings, degraded quality |
-| TurboQuant | ✅ Implemented | Mixed Q8/Q6/Q4 per head |
-| Continuous batching | ✅ Single-slot verified | Multi-slot needs shared weights |
-| n_passes=2 weight sharing | ✅ Multi-M exists | Sequential dependency limits single-token |
-| Weight interleaving | ✅ Analyzed (0% benefit) | Current layout optimal |
+| Optimization | Status | Evidence |
+|-------------|--------|----------|
+| Per-block scaling | ✅ KEY FIX | Brought Q4/Q6/Q8 from broken to 85-90% accuracy parity |
+| Flash attention | ✅ Wired | --flash-attn flag, multi-tile verified |
+| Q8 KV cache | ✅ 90% accuracy | Per-32-block scaling, 49% VRAM savings |
+| Q6 KV cache | ✅ 85% accuracy | Per-32-block scaling, 62.5% VRAM savings |
+| Q4 KV cache | ✅ 90% accuracy | Per-32-block scaling, 75% VRAM savings |
+| TurboQuant | ⚠️ 50% accuracy | Mixed-precision attention kernel has bugs, needs debug |
+| Loop-aware (type 5) | ⚠️ Tied with Q4 | No measurable benefit at 150-token context. Theory needs 2K+ retrieval test |
+| Continuous batching | ✅ Single-slot + multi-slot | Shared weights via load_shared(), SSE verified |
+| n_passes=2 weight sharing | ✅ Multi-M exists | Sequential loop dependency limits single-token |
+| Weight interleaving | ✅ 0% benefit | Current layout optimal |
 | lm_head pruning | ✅ Implemented | --lm-head-prune N |
-| Batched prefill | ✅ Implemented | 38% TTFT reduction |
-| Quality vs llama.cpp | ⚠️ Need clean GPU | Viper quality verified, speed comparison done |
+| Batched prefill | ✅ Implemented | Fixed batch clamping bug (was limited to 5) |
+| Quality vs llama.cpp | ⚠️ Partial | Viper verified correct. llama.cpp too slow for side-by-side |
+
+## What Actually Matters
+
+The per-32-block scaling fix is the single most important change. Before it,
+Q4 produced Chinese garbage. After it, all cache types score 85-90%. The fix:
+each warp handles one block of 32 values independently with its own scale,
+eliminating outlier-sensitivity that per-head scaling suffered from.
+
+Loop-aware cache (Q8 loop0 + Q4 loop1) is implemented but NOT validated.
+At 150-token math/knowledge QA, it ties uniform Q4. The compounding-error
+hypothesis is plausible but requires a retrieval benchmark at 2K+ positions
+to test — embed a fact at position 500 in a 2K document, retrieve it.
