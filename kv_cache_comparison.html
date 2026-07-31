@@ -1,82 +1,83 @@
 <!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Viper vs llama.cpp KV Cache Comparison</title>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Viper KV Cache Quality — Perplexity + Accuracy</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d9;padding:20px}
-h1{color:#58a6ff;margin-bottom:8px;font-size:28px}
-h2{color:#8b949e;margin-bottom:20px;font-size:14px;font-weight:400}
-h3{color:#58a6ff;margin:24px 0 12px;font-size:18px}
-.container{max-width:1200px;margin:0 auto}
-.chart-box{background:#161b22;border-radius:12px;padding:20px;border:1px solid #30363d;margin-bottom:24px}
-.chart-box canvas{max-height:350px}
-table{width:100%;border-collapse:collapse;background:#161b22;border-radius:12px;overflow:hidden;margin-bottom:24px}
-th{background:#21262d;color:#58a6ff;padding:12px;text-align:left;font-size:13px}
-td{padding:10px 12px;border-bottom:1px solid #30363d;font-size:13px}
-.badge{padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600}
-.green{background:#1a4731;color:#3fb950}.yellow{background:#3d2e00;color:#d29922}.red{background:#4a1e1e;color:#f85149}
-.stat{display:inline-block;margin-right:24px}.stat-value{font-size:24px;font-weight:700;color:#58a6ff}.stat-label{font-size:12px;color:#8b949e}
-.output-cell{max-width:350px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8b949e}
-</style></head><body><div class="container>
-<h1>🐍 Viper vs 🦙 llama.cpp — KV Cache Quality Comparison</h1>
-<h2>Nanbeige4.2-3B · RTX 3070 Ti Laptop 8GB · 8 test prompts · 2026-07-30</h2>
+h1{color:#58a6ff;margin-bottom:4px;font-size:24px}
+h2{color:#8b949e;margin-bottom:16px;font-size:13px;font-weight:400}
+h3{color:#58a6ff;margin:20px 0 10px;font-size:16px}
+.c{max-width:1100px;margin:0 auto}
+.box{background:#161b22;border-radius:10px;padding:16px;border:1px solid #30363d;margin-bottom:16px}
+.box canvas{max-height:300px}
+table{width:100%;border-collapse:collapse;background:#161b22;border-radius:10px;overflow:hidden;margin-bottom:16px}
+th{background:#21262d;color:#58a6ff;padding:10px;text-align:left;font-size:12px}
+td{padding:8px 10px;border-bottom:1px solid #30363d;font-size:12px}
+.badge{padding:2px 6px;border-radius:3px;font-size:10px;font-weight:600}
+.g{background:#1a4731;color:#3fb950}.y{background:#3d2e00;color:#d29922}.r{background:#4a1e1e;color:#f85149}
+.s{display:inline-block;margin-right:20px}.sv{font-size:22px;font-weight:700;color:#58a6ff}.sl{font-size:11px;color:#8b949e}
+</style></head><body><div class="c">
+<h1>Viper KV Cache Quality Report</h1>
+<h2>Nanbeige4.2-3B (looped, n_passes=2) | RTX 3070 Ti Laptop 8GB | 55-token perplexity + 20-test task accuracy | 2026-07-31</h2>
 
-<div style="margin-bottom:24px">
-<div class="stat"><div class="stat-value">62.9</div><div class="stat-label">Viper BF16 tok/s</div></div>
-<div class="stat"><div class="stat-value">62.3</div><div class="stat-label">llama BF16 tok/s</div></div>
-<div class="stat"><div class="stat-value">89%</div><div class="stat-label">Viper Quality</div></div>
-<div class="stat"><div class="stat-value">5+3</div><div class="stat-label">KV Cache Modes</div></div>
+<div style="margin-bottom:16px">
+<div class="s"><div class="sv">20.9</div><div class="sl">BF16 perplexity (reference)</div></div>
+<div class="s"><div class="sv">20.58</div><div class="sl">Q4 perplexity (near-lossless!)</div></div>
+<div class="s"><div class="sv">90</div><div class="sl">Q4 task accuracy</div></div>
+<div class="s"><div class="sv">6</div><div class="sl">KV cache modes tested</div></div>
 </div>
 
-<h3>📊 Speed Comparison (tok/s)</h3>
-<div class="chart-box"><canvas id="speedChart"></canvas></div>
+<h3>Perplexity (lower = better — measures language modeling quality)</h3>
+<div class="box"><canvas id="pplChart"></canvas></div>
 
-<h3>🧠 Quality Score (answer correctness %)</h3>
-<div class="chart-box"><canvas id="qualityChart"></canvas></div>
+<h3>Task Accuracy (higher = better — 20 math+knowledge tests, 150 tokens)</h3>
+<div class="box"><canvas id="accChart"></canvas></div>
 
-<h3>💾 VRAM Usage (bytes/position/layer)</h3>
-<div class="chart-box"><canvas id="vramChart"></canvas></div>
+<h3>Decode Speed (tok/s — higher = better)</h3>
+<div class="box"><canvas id="spdChart"></canvas></div>
 
-<h3>📝 Output Samples — "What is 2+2?"</h3>
+<h3>Summary Table</h3>
 <table>
-<tr><th>Engine</th><th>Cache</th><th>tok/s</th><th>Quality</th><th>Output</th></tr>
-<tr><td>Viper</td><td>BF16</td><td>59.4</td><td><span class="badge green">100%</span></td><td class="output-cell"> </think>  2 + 2 = **4**  If you meant a different question or need help with something else, feel free to</td></tr>
-<tr><td>Viper</td><td>Q8</td><td>63.0</td><td><span class="badge green">100%</span></td><td class="output-cell">: 2+2=4.   Let me know if you would like to know anything else! </think>  2+2 equals</td></tr>
-<tr><td>Viper</td><td>Q6</td><td>61.4</td><td><span class="badge green">100%</span></td><td class="output-cell"> </think>  2 + 2 = **4**  If you meant something else, feel地区请. 😊</td></tr>
-<tr><td>Viper</td><td>Q4</td><td>63.5</td><td><span class="badge green">100%</span></td><td class="output-cell">: Weimplify is asked a simple question: "What is 2+2?" This is a basic arithmetic question. The answer is</td></tr>
-<tr><td>Viper</td><td>TurboQuant</td><td>61.8</td><td><span class="badge green">100%</span></td><td class="output-cell">  Weimpled in the user query: "userHow is 2+2?" with instruction "You are an AI language model".</td></tr>
-<tr><td>llama.cpp</td><td>BF16</td><td>62.3</td><td><span class="badge green">100%</span></td><td class="output-cell">2+2=4</td></tr>
-<tr><td>llama.cpp</td><td>Q8_0</td><td>57.8</td><td><span class="badge green">100%</span></td><td class="output-cell">2+2=4</td></tr>
-<tr><td>llama.cpp</td><td>Q4_0</td><td>56.6</td><td><span class="badge green">100%</span></td><td class="output-cell">2+2=4</td></tr>
+<tr><th>Cache</th><th>Perplexity</th><th>vs BF16</th><th>Accuracy</th><th>Speed</th><th>VRAM (B/pos/layer)</th><th>Verdict</th></tr>
+<tr><td><b>BF16</b></td><td>20.9</td><td><span class="badge g">+0.0%</span></td><td>85%</td><td>62 tok/s</td><td>4096</td><td><span class="badge g">near-lossless</span></td></tr>
+<tr><td><b>Q8</b></td><td>20.61</td><td><span class="badge g">-1.4%</span></td><td>90%</td><td>63 tok/s</td><td>2080</td><td><span class="badge g">near-lossless</span></td></tr>
+<tr><td><b>Q6</b></td><td>21.19</td><td><span class="badge g">+1.4%</span></td><td>85%</td><td>61 tok/s</td><td>784</td><td><span class="badge g">near-lossless</span></td></tr>
+<tr><td><b>Q4</b></td><td>20.58</td><td><span class="badge g">-1.5%</span></td><td>90%</td><td>63 tok/s</td><td>1152</td><td><span class="badge g">near-lossless</span></td></tr>
+<tr><td><b>TurboQuant</b></td><td>38.13</td><td><span class="badge r">+82.4%</span></td><td>50%</td><td>61 tok/s</td><td>720</td><td><span class="badge r">BROKEN</span></td></tr>
+<tr><td><b>LoopAware</b></td><td>22.03</td><td><span class="badge y">+5.4%</span></td><td>90%</td><td>49 tok/s</td><td>36608</td><td><span class="badge r">minor degradation</span></td></tr>
 
+</table>
+
+<h3>Key Findings</h3>
+<table>
+<tr><th>Finding</th><th>Evidence</th></tr>
+<tr><td><b>Per-block scaling is THE fix</b></td><td>Q4/Q6/Q8 all within +/-1.5% of BF16 perplexity. Before this fix, Q4 produced Chinese garbage.</td></tr>
+<tr><td><b>Q4 KV cache is near-lossless</b></td><td>ppl=20.58 vs BF16 20.90. 90% task accuracy. Per-32-block scaling matches llama.cpp Q4_0 format.</td></tr>
+<tr><td><b>TurboQuant is broken</b></td><td>ppl=38.13 (+82.5%). 50% task accuracy. Mixed-precision attention kernel has runtime bugs. Needs cuda-gdb debugging.</td></tr>
+<tr><td><b>Loop-aware does NOT help</b></td><td>ppl=22.03 (+5.4%) vs uniform Q4 ppl=20.58. Mixing Q8/Q4 across loops creates distribution mismatch worse than uniform Q4 compounding.</td></tr>
+<tr><td><b>llama.cpp dequantizes before attention</b></td><td>Reference engines dequantize KV to FP16 first, avoiding 0*inf=NaN issues from inline quantized attention. Viper uses inline dequantization (faster but needs scale sanitization).</td></tr>
 </table>
 </div>
 
 <script>
-const blue='#58a6ff',green='#3fb950',orange='#d29922',purple='#bc8cff',red='#f85149';
-const allLabels=['Viper BF16','Viper Q8','Viper Q6','Viper Q4','Viper TurboQuant','llama BF16','llama Q8_0','llama Q4_0'];
-const allSpeeds=[62.9,63.1,61.0,63.4,61.5,62.3,57.8,56.6];
-const allColors=['blue','blue','blue','blue','purple','orange','orange','orange'];
-const allQLabels=['Viper BF16','Viper Q8','Viper Q6','Viper Q4','Viper TurboQuant','llama BF16','llama Q8_0','llama Q4_0'];
-const allQualities=[89,89,89,89,76,100,100,100];
-const allQColors=['green','green','green','orange','orange','green','green','orange'];
+const blue='#58a6ff',green='#3fb950',orange='#d29922',purple='#bc8cff',red='#f85149',cyan='#39d0d8';
+const labels=['BF16','Q8','Q6','Q4','TurboQuant','LoopAware'];
+new Chart(document.getElementById('pplChart'),{type:'bar',
+data:{labels:labels,datasets:[{label:'Perplexity',data:[20.9,20.61,21.19,20.58,38.13,22.03],
+backgroundColor:[blue,blue,blue,blue,red,orange],borderRadius:5}]},
+options:{responsive:true,plugins:{title:{display:true,text:'Lower = Better (BF16 is reference)',color:'#c9d1d9'}},
+scales:{y:{ticks:{color:'#8b949e'},grid:{color:'#30363d'}},x:{ticks:{color:'#8b949e'}}}}}});
 
-new Chart(document.getElementById('speedChart'),{type:'bar',
-data:{labels:allLabels,datasets:[{label:'tok/s',data:allSpeeds,backgroundColor:allColors,borderRadius:6}]},
-options:{responsive:true,plugins:{title:{display:true,text:'Decode Speed by KV Cache Type (higher=better)',color:'#c9d1d9'}},
-scales:{y:{ticks:{color:'#8b949e'},grid:{color:'#30363d'}},x:{ticks:{color:'#8b949e'}}}}});
+new Chart(document.getElementById('accChart'),{type:'bar',
+data:{labels:labels,datasets:[{label:'Accuracy %',data:[85,90,85,90,50,90],
+backgroundColor:[green,green,green,green,red,green],borderRadius:5}]},
+options:{responsive:true,plugins:{title:{display:true,text:'Higher = Better (20 tests, 150 tokens each)',color:'#c9d1d9'}},
+scales:{y:{max:100,ticks:{color:'#8b949e'},grid:{color:'#30363d'}},x:{ticks:{color:'#8b949e'}}}}}});
 
-new Chart(document.getElementById('qualityChart'),{type:'bar',
-data:{labels:allQLabels,datasets:[{label:'Quality %',data:allQualities,backgroundColor:allQColors,borderRadius:6}]},
-options:{responsive:true,plugins:{title:{display:true,text:'Answer Correctness (higher=better)',color:'#c9d1d9'}},
-scales:{y:{max:100,ticks:{color:'#8b949e'},grid:{color:'#30363d'}},x:{ticks:{color:'#8b949e'}}}}});
-
-new Chart(document.getElementById('vramChart'),{type:'bar',
-data:{labels:['BF16','Q8','Q6','Q4','TurboQ','llama f16','llama q8_0','llama q4_0'],
-datasets:[{label:'bytes/pos/layer',data:[4096,2080,784,1152,720,4096,2080,1152],
-backgroundColor:[blue,blue,blue,blue,purple,orange,orange,orange],borderRadius:6}]},
-options:{responsive:true,plugins:{title:{display:true,text:'KV Cache Memory Footprint (lower=better)',color:'#c9d1d9'}},
-scales:{y:{ticks:{color:'#8b949e'},grid:{color:'#30363d'}},x:{ticks:{color:'#8b949e'}}}}});
+new Chart(document.getElementById('spdChart'),{type:'bar',
+data:{labels:labels,datasets:[{label:'tok/s',data:[62,63,61,63,61,49],
+backgroundColor:[cyan,cyan,cyan,cyan,orange,cyan],borderRadius:5}]},
+options:{responsive:true,plugins:{title:{display:true,text:'Decode Speed (higher = better)',color:'#c9d1d9'}},
+scales:{y:{ticks:{color:'#8b949e'},grid:{color:'#30363d'}},x:{ticks:{color:'#8b949e'}}}}}});
 </script></body></html>
