@@ -143,13 +143,21 @@ int main(int argc, char** argv) {
             const __nv_bfloat16* dl = engine.get_logits();
             cudaMemcpy(h_logits.data(), dl, engine.cfg.vocab * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
             float mx = -1e30f;
-            for (int v = 0; v < engine.cfg.vocab; ++v)
-                mx = fmaxf(mx, __bfloat162float(h_logits[v]));
+            for (int v = 0; v < engine.cfg.vocab; ++v) {
+                float val = __bfloat162float(h_logits[v]);
+                if (!isfinite(val)) val = -100.0f;  // clamp inf/NaN
+                mx = fmaxf(mx, val);
+            }
             float se = 0.f;
-            for (int v = 0; v < engine.cfg.vocab; ++v)
-                se += expf(__bfloat162float(h_logits[v]) - mx);
+            for (int v = 0; v < engine.cfg.vocab; ++v) {
+                float val = __bfloat162float(h_logits[v]);
+                if (!isfinite(val)) val = -100.0f;
+                se += expf(val - mx);
+            }
             float lse = mx + logf(se);
-            float lp = __bfloat162float(h_logits[ids[i+1]]) - lse;
+            float actual = __bfloat162float(h_logits[ids[i+1]]);
+            if (!isfinite(actual)) actual = -100.0f;
+            float lp = actual - lse;
             total_nll += -lp;
             count++;
         }
