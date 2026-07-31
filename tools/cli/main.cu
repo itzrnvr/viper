@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
     int cacheType = std::atoi(argval(argc, argv, "--cache-type", "0").c_str());  // 0=bf16 1=q8 2=q6 3=q4
     int flashAttn = std::atoi(argval(argc, argv, "--flash-attn", "0").c_str());  // 1=force flash decoding
     int prefillBatch = std::atoi(argval(argc, argv, "--prefill-batch", "8").c_str());
+    int perplexityMode = std::atoi(argval(argc, argv, "--perplexity", "0").c_str());
     if (usePersistent > 0 || useGraph > 0) spec_k = 0;  // graph/persistent: single-token decode
 
     viper::Tokenizer tok;
@@ -129,6 +130,33 @@ int main(int argc, char** argv) {
     std::vector<int32_t> ids = tok.encode(full);
     std::printf("[cli] prompt tokens: %zu  spec_k=%d\n", ids.size(), spec_k);
     std::fflush(stdout);
+
+    // Perplexity measurement: teacher forcing, log-softmax over full vocab
+    if (perplexityMode) {
+        engine.cfg.lm_prune = 0;  // need full vocab for correct perplexity
+        std::vector<__nv_bfloat16> h_logits(engine.cfg.vocab);
+        double total_nll = 0.0;
+        int count = 0;
+        for (size_t i = 0; i + 1 < ids.size(); ++i) {
+            int32_t predicted;
+            if (!engine.forward(ids[i], true, &predicted)) return 1;
+            const __nv_bfloat16* dl = engine.get_logits();
+            cudaMemcpy(h_logits.data(), dl, engine.cfg.vocab * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+            float mx = -1e30f;
+            for (int v = 0; v < engine.cfg.vocab; ++v)
+                mx = fmaxf(mx, __bfloat162float(h_logits[v]));
+            float se = 0.f;
+            for (int v = 0; v < engine.cfg.vocab; ++v)
+                se += expf(__bfloat162float(h_logits[v]) - mx);
+            float lse = mx + logf(se);
+            float lp = __bfloat162float(h_logits[ids[i+1]]) - lse;
+            total_nll += -lp;
+            count++;
+        }
+        double ppl = exp(total_nll / count);
+        std::printf("[perplexity] tokens=%d ppl=%.4f nll=%.6f\n", count, ppl, total_nll / count);
+        return 0;
+    }
 
     auto t0 = std::chrono::steady_clock::now();
 

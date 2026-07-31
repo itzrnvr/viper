@@ -456,6 +456,7 @@ public:
     void reset() { seq_len_ = 0; }
     // Expose hidden state for drafter (EAGLE spec decode).
     const __nv_bfloat16* get_hidden() const { return x_; }
+    const __nv_bfloat16* get_logits() const { return logits_; }
     const __nv_bfloat16* get_embed() const { return embed_; }
     const uint8_t* get_lm_head_packed() const { return lm_head_q4_.packed; }
     const __nv_bfloat16* get_lm_head_scales() const { return lm_head_q4_.scales; }
