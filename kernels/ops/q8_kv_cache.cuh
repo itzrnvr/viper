@@ -74,92 +74,70 @@ __global__ void kv_bf16_to_q8_kernel(
             __bfloat162float(kv_bf16[h * HD + d]) * inv_scale);
 }
 
-// Quantize K to cache (fused with position offset).
-// Grid: (nKV_heads) blocks.
+// Quantize K to cache with per-32-block scaling (like Q4_0 but 8-bit).
+// Each warp handles one block of 32 dims independently — no inter-warp reduction.
+// Grid: (nKV_heads) blocks, 128 threads (4 warps x 32 lanes = 4 blocks).
 __global__ void k_to_q8_cache_kernel(
     const __nv_bfloat16* __restrict__ k_src,     // [nKV, HD] BF16 (after rope)
     int8_t* __restrict__ k_cache,                 // [max_seq, nKV, HD] INT8
-    __nv_bfloat16* __restrict__ k_scales,         // [max_seq, nKV] FP16
+    __nv_bfloat16* __restrict__ k_scales,         // [max_seq, nKV, HD/32] per-block FP16
     int pos, int nKV, int HD) {
     const int h = blockIdx.x;
     if (h >= nKV) return;
     const int tid = threadIdx.x;
-    const int nthreads = blockDim.x;
+    const int wid = tid >> 5;    // warp ID = block ID (0-3)
+    const int lid = tid & 31;   // lane = dim within block
+    const int nBlocks = HD / 32;
 
-    int8_t* cache_row = k_cache + (size_t)pos * nKV * HD;
-    __nv_bfloat16* scale_row = k_scales + (size_t)pos * nKV;
+    int8_t* cache_row = k_cache + (size_t)pos * nKV * HD + h * HD;
+    __nv_bfloat16* scale_row = k_scales + (size_t)pos * nKV * nBlocks + h * nBlocks;
 
-    float gmax = 0.f;
-    for (int d = tid; d < HD; d += nthreads)
-        gmax = fmaxf(gmax, fabsf(__bfloat162float(k_src[h * HD + d])));
+    // Each warp handles dims [wid*32, wid*32+31]
+    const int d = wid * 32 + lid;
+    float val = (d < HD) ? fabsf(__bfloat162float(k_src[h * HD + d])) : 0.0f;
+
+    // Warp-only max reduction (no inter-warp communication!)
     for (int off = 16; off > 0; off >>= 1)
-        gmax = fmaxf(gmax, __shfl_xor_sync(0xffffffff, gmax, off));
-    // Inter-warp reduction (CRITICAL: was missing, only warp 0's max was used)
-    __shared__ float warp_max[8];
-    const int wid = tid >> 5, lid = tid & 31;
-    if (lid == 0) warp_max[wid] = gmax;
-    __syncthreads();
-    __shared__ float s_gmax;
-    if (tid == 0) {
-        float m = warp_max[0];
-        for (int i = 1; i < (nthreads >> 5); ++i) m = fmaxf(m, warp_max[i]);
-        s_gmax = m;
-    }
-    __syncthreads();
+        val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, off));
 
-    float scale = fmaxf(s_gmax / 127.0f, 1e-8f);
-    if (tid == 0) scale_row[h] = __float2bfloat16(scale);
-    __syncthreads();
+    float scale = fmaxf(val / 127.0f, 1e-8f);
+    if (lid == 0) scale_row[wid] = __float2bfloat16(scale);
 
+    // Quantize: each lane writes its own dim
     float inv_scale = 1.0f / scale;
-    for (int d = tid; d < HD; d += nthreads)
-        cache_row[h * HD + d] = (int8_t)__float2int_rn(
+    if (d < HD)
+        cache_row[d] = (int8_t)__float2int_rn(
             __bfloat162float(k_src[h * HD + d]) * inv_scale);
 }
 
-// V to Q8 cache (same as K but for V).
+// V to Q8 cache with per-32-block scaling (same pattern as K).
 __global__ void v_to_q8_cache_kernel(
     const __nv_bfloat16* __restrict__ v_src,
     int8_t* __restrict__ v_cache,
-    __nv_bfloat16* __restrict__ v_scales,
+    __nv_bfloat16* __restrict__ v_scales,         // [max_seq, nKV, HD/32] per-block
     int pos, int nKV, int HD) {
     const int h = blockIdx.x;
     if (h >= nKV) return;
     const int tid = threadIdx.x;
-    const int nthreads = blockDim.x;
+    const int wid = tid >> 5, lid = tid & 31;
+    const int nBlocks = HD / 32;
 
-    int8_t* cache_row = v_cache + (size_t)pos * nKV * HD;
-    __nv_bfloat16* scale_row = v_scales + (size_t)pos * nKV;
+    int8_t* cache_row = v_cache + (size_t)pos * nKV * HD + h * HD;
+    __nv_bfloat16* scale_row = v_scales + (size_t)pos * nKV * nBlocks + h * nBlocks;
 
-    float gmax = 0.f;
-    for (int d = tid; d < HD; d += nthreads)
-        gmax = fmaxf(gmax, fabsf(__bfloat162float(v_src[h * HD + d])));
+    const int d = wid * 32 + lid;
+    float val = (d < HD) ? fabsf(__bfloat162float(v_src[h * HD + d])) : 0.0f;
     for (int off = 16; off > 0; off >>= 1)
-        gmax = fmaxf(gmax, __shfl_xor_sync(0xffffffff, gmax, off));
-    __shared__ float vwarp_max[8];
-    const int vwid = tid >> 5, vlid = tid & 31;
-    if (vlid == 0) vwarp_max[vwid] = gmax;
-    __syncthreads();
-    __shared__ float vs_gmax;
-    if (tid == 0) {
-        float m = vwarp_max[0];
-        for (int i = 1; i < (nthreads >> 5); ++i) m = fmaxf(m, vwarp_max[i]);
-        vs_gmax = m;
-    }
-    __syncthreads();
+        val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, off));
 
-    float scale = fmaxf(vs_gmax / 127.0f, 1e-8f);
-    if (tid == 0) scale_row[h] = __float2bfloat16(scale);
-    __syncthreads();
+    float scale = fmaxf(val / 127.0f, 1e-8f);
+    if (lid == 0) scale_row[wid] = __float2bfloat16(scale);
 
     float inv_scale = 1.0f / scale;
-    for (int d = tid; d < HD; d += nthreads)
-        cache_row[h * HD + d] = (int8_t)__float2int_rn(
+    if (d < HD)
+        cache_row[d] = (int8_t)__float2int_rn(
             __bfloat162float(v_src[h * HD + d]) * inv_scale);
 }
-
-// attn_decode_q8 is implemented in attn_decode_kernel.cu (correct flash-style version)
-// Only quantize/dequantize kernels are kept here.
 
 // Launchers
 cudaError_t k_to_q8_cache(

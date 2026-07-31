@@ -108,52 +108,44 @@ __global__ void kv_bf16_to_q6_kernel(
     }
 }
 
-// Q6 KV cache for specific position (fused with position offset).
+// Q6 KV cache with per-32-block scaling. Each warp = 1 block, no inter-warp reduction.
 __global__ void kv_to_q6_cache_kernel(
     const __nv_bfloat16* __restrict__ kv_src,
     uint8_t* __restrict__ kv_cache,               // [max_seq, nKV, HD/4*3]
-    __nv_bfloat16* __restrict__ kv_scales,        // [max_seq, nKV]
+    __nv_bfloat16* __restrict__ kv_scales,        // [max_seq, nKV, HD/32] per-block
     int pos, int nKV, int HD) {
     const int h = blockIdx.x;
     if (h >= nKV) return;
     const int tid = threadIdx.x;
+    const int wid = tid >> 5, lid = tid & 31;
+    const int nBlocks = HD / 32;
 
     uint8_t* cache_row = kv_cache + (size_t)pos * nKV * (HD / 4 * 3) + (size_t)h * (HD / 4 * 3);
-    __nv_bfloat16* scale_row = kv_scales + (size_t)pos * nKV;
+    __nv_bfloat16* scale_row = kv_scales + (size_t)pos * nKV * nBlocks + (size_t)h * nBlocks;
 
-    float gmax = 0.f;
-    for (int d = tid; d < HD; d += blockDim.x)
-        gmax = fmaxf(gmax, fabsf(__bfloat162float(kv_src[h * HD + d])));
+    // Each warp handles dims [wid*32, wid*32+31]
+    const int d = wid * 32 + lid;
+    float val = (d < HD) ? fabsf(__bfloat162float(kv_src[h * HD + d])) : 0.0f;
     for (int off = 16; off > 0; off >>= 1)
-        gmax = fmaxf(gmax, __shfl_xor_sync(0xffffffff, gmax, off));
-    __shared__ float q6c_warp_max[8];
-    const int cwid = tid >> 5, clid = tid & 31;
-    if (clid == 0) q6c_warp_max[cwid] = gmax;
-    __syncthreads();
-    __shared__ float q6c_s_gmax;
-    if (tid == 0) {
-        float m = q6c_warp_max[0];
-        for (int i = 1; i < (blockDim.x >> 5); ++i) m = fmaxf(m, q6c_warp_max[i]);
-        q6c_s_gmax = m;
-    }
-    __syncthreads();
+        val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, off));
 
-    float scale = fmaxf(q6c_s_gmax / 31.0f, 1e-8f);
-    if (tid == 0) scale_row[h] = __float2bfloat16(scale);
-    __syncthreads();
+    float scale = fmaxf(val / 31.0f, 1e-8f);
+    if (lid == 0) scale_row[wid] = __float2bfloat16(scale);
 
     float inv_scale = 1.0f / scale;
-    if (tid < HD / 4) {
-        int base = tid * 4;
+    // Pack 4 values per 3 bytes. Lanes 0-7 pack groups 0-7 within this warp's block.
+    if (lid < 8) {
+        int base = wid * 32 + lid * 4;
         int q0 = max(-32, min(31, (int)roundf(__bfloat162float(kv_src[h * HD + base]) * inv_scale)));
         int q1 = max(-32, min(31, (int)roundf(__bfloat162float(kv_src[h * HD + base + 1]) * inv_scale)));
         int q2 = max(-32, min(31, (int)roundf(__bfloat162float(kv_src[h * HD + base + 2]) * inv_scale)));
         int q3 = max(-32, min(31, (int)roundf(__bfloat162float(kv_src[h * HD + base + 3]) * inv_scale)));
         uint8_t b0, b1, b2;
         pack_q6(q0, q1, q2, q3, b0, b1, b2);
-        cache_row[tid * 3] = b0;
-        cache_row[tid * 3 + 1] = b1;
-        cache_row[tid * 3 + 2] = b2;
+        int pack_off = wid * 24 + lid * 3;  // 8 groups * 3 bytes per block
+        cache_row[pack_off] = b0;
+        cache_row[pack_off + 1] = b1;
+        cache_row[pack_off + 2] = b2;
     }
 }
 

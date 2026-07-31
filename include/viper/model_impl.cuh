@@ -74,7 +74,7 @@ namespace viper {
     std::fprintf(stderr, "[viper] cuda error %s at %s:%d\n", \
         cudaGetErrorString(e_), __FILE__, __LINE__); return false; } } while (0)
 
-enum KVCacheType { KV_BF16 = 0, KV_Q8 = 1, KV_Q6 = 2, KV_Q4 = 3, KV_TURBO = 4 };
+enum KVCacheType { KV_BF16 = 0, KV_Q8 = 1, KV_Q6 = 2, KV_Q4 = 3, KV_TURBO = 4, KV_LOOP_AWARE = 5 };
 
 struct ModelConfig {
     int n_layers = 22, n_passes = 2, hidden = 3072, intermediate = 10752;
@@ -292,7 +292,7 @@ public:
         // Q8 KV cache (when enabled)
         if (cfg.kv_cache_type == KV_Q8) {
             size_t q8_data = (size_t)kv_max_seq * cfg.n_kv_heads * HD;
-            size_t q8_sc = (size_t)kv_max_seq * cfg.n_kv_heads * sizeof(__nv_bfloat16);
+            size_t q8_sc = (size_t)kv_max_seq * cfg.n_kv_heads * (HD / 32) * sizeof(__nv_bfloat16);
             q8_k_cache_.resize(kv_slots_); q8_v_cache_.resize(kv_slots_);
             q8_k_scales_.resize(kv_slots_); q8_v_scales_.resize(kv_slots_);
             for (int s = 0; s < kv_slots_; ++s) {
@@ -306,7 +306,7 @@ public:
         }
         if (cfg.kv_cache_type == KV_Q6) {
             size_t q6_data = (size_t)kv_max_seq * cfg.n_kv_heads * HD / 4 * 3;
-            size_t q6_sc = (size_t)kv_max_seq * cfg.n_kv_heads * sizeof(__nv_bfloat16);
+            size_t q6_sc = (size_t)kv_max_seq * cfg.n_kv_heads * (HD / 32) * sizeof(__nv_bfloat16);
             q6_k_cache_.resize(kv_slots_); q6_v_cache_.resize(kv_slots_);
             q6_k_scales_.resize(kv_slots_); q6_v_scales_.resize(kv_slots_);
             for (int s = 0; s < kv_slots_; ++s) {
@@ -355,6 +355,32 @@ public:
             turbo_total_offset_ = tq_total;
             std::printf("[viper] TurboQuant KV: %d slots (%.2f GB, mixed Q8/Q6/Q4)\n", kv_slots_,
                         (double)kv_slots_ * (tq_data + tq_sc) * 2 / 1e9);
+        }
+        if (cfg.kv_cache_type == KV_LOOP_AWARE) {
+            int half = cfg.n_layers;
+            // Loop 0: Q8 (minimize error propagation to loop 1)
+            size_t q8d = (size_t)kv_max_seq * cfg.n_kv_heads * HD;
+            size_t q8s = (size_t)kv_max_seq * cfg.n_kv_heads * (HD / 32) * sizeof(__nv_bfloat16);
+            q8_k_cache_.resize(half); q8_v_cache_.resize(half);
+            q8_k_scales_.resize(half); q8_v_scales_.resize(half);
+            for (int s = 0; s < half; ++s) {
+                if (!alloc((void**)&q8_k_cache_[s], q8d)) return false;
+                if (!alloc((void**)&q8_v_cache_[s], q8d)) return false;
+                if (!alloc((void**)&q8_k_scales_[s], q8s)) return false;
+                if (!alloc((void**)&q8_v_scales_[s], q8s)) return false;
+            }
+            // Loop 1: Q4 per-block (final pass, errors don't compound)
+            size_t q4d = (size_t)kv_max_seq * cfg.n_kv_heads * HD / 2;
+            size_t q4s = (size_t)kv_max_seq * cfg.n_kv_heads * (HD / 32) * sizeof(__nv_bfloat16);
+            q4_k_cache_.resize(half); q4_v_cache_.resize(half);
+            q4_k_scales_.resize(half); q4_v_scales_.resize(half);
+            for (int s = 0; s < half; ++s) {
+                if (!alloc((void**)&q4_k_cache_[s], q4d)) return false;
+                if (!alloc((void**)&q4_v_cache_[s], q4d)) return false;
+                if (!alloc((void**)&q4_k_scales_[s], q4s)) return false;
+                if (!alloc((void**)&q4_v_scales_[s], q4s)) return false;
+            }
+            std::printf("[viper] Loop-aware KV: loop0=Q8 (%d slots), loop1=Q4 (%d slots)\n", half, half);
         }
 
         // Device-side copies for persistent kernel.
@@ -628,6 +654,25 @@ private:
                     VK(ops::attn_decode_turbo(vb_, turbo_k_cache_[slot], turbo_k_scales_[slot],
                                                turbo_v_cache_[slot], turbo_v_scales_[slot], attn_,
                                                nQ, nKVh, HD, pos + 1, attn_scale, turbo_total_offset_, s_));
+                } else if (cfg.kv_cache_type == KV_LOOP_AWARE) {
+                    if (slot < cfg.n_layers) {
+                        // Loop 0: Q8 (minimize error propagation to loop 1)
+                        VK(ops::k_to_q8_cache(kv_k_[slot] + (size_t)pos * nKVh * HD,
+                                               q8_k_cache_[slot], q8_k_scales_[slot], pos, nKVh, HD, s_));
+                        VK(ops::v_to_q8_cache(v_cache_ptr, q8_v_cache_[slot], q8_v_scales_[slot], pos, nKVh, HD, s_));
+                        VK(ops::attn_decode_q8(vb_, q8_k_cache_[slot], q8_k_scales_[slot],
+                                                q8_v_cache_[slot], q8_v_scales_[slot], attn_,
+                                                nQ, nKVh, HD, pos + 1, attn_scale, s_));
+                    } else {
+                        // Loop 1: Q4 per-block (final pass, errors don't compound)
+                        int s4 = slot - cfg.n_layers;
+                        VK(ops::k_to_q4_cache(kv_k_[slot] + (size_t)pos * nKVh * HD,
+                                               q4_k_cache_[s4], q4_k_scales_[s4], pos, nKVh, HD, s_));
+                        VK(ops::v_to_q4_cache(v_cache_ptr, q4_v_cache_[s4], q4_v_scales_[s4], pos, nKVh, HD, s_));
+                        VK(ops::attn_decode_q4(vb_, q4_k_cache_[s4], q4_k_scales_[s4],
+                                                q4_v_cache_[s4], q4_v_scales_[s4], attn_,
+                                                nQ, nKVh, HD, pos + 1, attn_scale, s_));
+                    }
                 } else {
                     if (cfg.use_flash_attn) {
                         VK(ops::flash_decode_bf16(vb_, kv_k_[slot], kv_v_[slot], attn_,

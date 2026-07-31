@@ -163,9 +163,13 @@ __global__ void attn_decode_q8_kernel(
         // Dots: dequantize K inline
         for (int j = tid; j < c_len; j += nthreads) {
             const int8_t* k_row = k_cache_q8 + (size_t)(c0 + j) * kv_stride + kv_off;
-            float k_sc = __bfloat162float(k_scales[(size_t)(c0 + j) * nKV + h_kv]);
+            const int nBlocks = D / 32;
             float d = 0.0f;
-            for (int i = 0; i < D; ++i) d += q_vec[i] * ((float)k_row[i] * k_sc);
+            for (int i = 0; i < D; ++i) {
+                int blk = i / 32;
+                float k_sc = __bfloat162float(k_scales[(size_t)(c0 + j) * nKV * nBlocks + h_kv * nBlocks + blk]);
+                d += q_vec[i] * ((float)k_row[i] * k_sc);
+            }
             dots[j] = d * scale;
         }
         __syncthreads();
@@ -189,7 +193,9 @@ __global__ void attn_decode_q8_kernel(
             for (int j = 0; j < c_len; ++j) {
                 const float w = __expf(dots[j] - m_new);
                 const int8_t* v_row = v_cache_q8 + (size_t)(c0 + j) * kv_stride + kv_off;
-                float v_sc = __bfloat162float(v_scales[(size_t)(c0 + j) * nKV + h_kv]);
+                int blk = tid / 32;
+                int nBlocks = D / 32;
+                float v_sc = __bfloat162float(v_scales[(size_t)(c0 + j) * nKV * nBlocks + h_kv * nBlocks + blk]);
                 acc_new += w * ((float)v_row[tid] * v_sc);
             }
         }
@@ -352,9 +358,11 @@ __global__ void attn_decode_q6_kernel(
         // Dots: unpack 4 Q6 values per 3 bytes, inline dequantize
         for (int j = tid; j < c_len; j += nthreads) {
             const uint8_t* k_row = k_cache_q6 + (size_t)(c0 + j) * kv_stride + kv_off;
-            float k_sc = __bfloat162float(k_scales[(size_t)(c0 + j) * nKV + h_kv]);
+            const int nBlocks = D / 32;
             float d = 0.0f;
             for (int i = 0; i < D; i += 4) {
+                int blk = i / 32;
+                float k_sc = __bfloat162float(k_scales[(size_t)(c0 + j) * nKV * nBlocks + h_kv * nBlocks + blk]);
                 const uint8_t* base = k_row + (i / 4) * 3;
                 int v0 = base[0] & 0x3F;
                 int v1 = ((base[0] >> 6) | (base[1] << 2)) & 0x3F;
@@ -392,7 +400,7 @@ __global__ void attn_decode_q6_kernel(
             for (int j = 0; j < c_len; ++j) {
                 const float w = __expf(dots[j] - m_new);
                 const uint8_t* v_row = v_cache_q6 + (size_t)(c0 + j) * kv_stride + kv_off;
-                float v_sc = __bfloat162float(v_scales[(size_t)(c0 + j) * nKV + h_kv]);
+                float v_sc = __bfloat162float(v_scales[(size_t)(c0 + j) * nKV * (D/32) + h_kv * (D/32) + (tid/32)]);
                 const uint8_t* base = v_row + group * 3;
                 int v;
                 switch (sub) {
