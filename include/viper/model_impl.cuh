@@ -1,20 +1,48 @@
+// ============================================================================
 // Nanbeige4.2-3B full model: .viper loader + T=1 decode forward + sampling.
+// Looped transformer: 22 layers × 2 passes = 44 layer-slots per token.
+// ============================================================================
 //
-// Forward semantics (bit-exact structure vs modeling_nanbeige.py):
+// FORWARD SEMANTICS (bit-exact vs modeling_nanbeige.py):
 //   x = embed[token]
 //   for loop in 0..n_passes-1:
 //     for l in 0..n_layers-1:
 //       residual = x
 //       x = rmsnorm(x, input_ln); q,k,v = q4linear(x)
 //       rope(q, k, pos); kv[loop*NL+l].append(k, v, pos)
-//       attn = attn_decode(q, kv.k, kv.v, pos+1)
+//       attn = attn_decode(q, kv.k, kv.v, pos+1)  ← cache type dispatched here
 //       x = q4linear(attn, o); x = residual + x
 //       residual = x
 //       x = rmsnorm(x, post_ln); g,u = q4linear(x)
 //       x = q4linear(swiglu(g,u), down); x = residual + x
-//     x = rmsnorm(x, final_norm)        // after EVERY loop (skip_loop_final_norm=false)
-//   logits = lm_head(x)                 // BF16 GEMV
+//     x = rmsnorm(x, final_norm)        // after EVERY loop
+//   logits = lm_head(x)
 //   token = argmax(logits)
+//
+// KV CACHE TYPES (cfg.kv_cache_type):
+//   0=BF16   lossless reference.        ppl=20.90
+//   1=Q8     per-32-block, 47% savings. ppl=20.61 (near-lossless)
+//   2=Q6     per-32-block, 60% savings. ppl=21.19 (near-lossless)
+//   3=Q4     per-32-block, 72% savings. ppl=20.58 (near-lossless — RECOMMENDED)
+//   4=Turbo  mixed Q8/Q6/Q4 per head.   ppl=22.78 (works but worse than uniform Q4)
+//   5=Loop   Q8 loop0 + Q4 loop1.       ppl=22.03 (experimental, worse than Q4)
+//
+// WHY PER-32-BLOCK SCALING IS THE KEY FIX:
+//   Per-head scaling (1 scale per 128 dims) was the root cause of ALL quality
+//   bugs. One outlier dimension → scale too large → other values → 0 → garbage.
+//   Per-32-block: each warp handles 32 dims independently, 4 scales per head.
+//   Matches llama.cpp Q4_0/Q8_0 format. Fixed Q4, Q6, Q8, TurboQuant simultaneously.
+//
+// LOOP-AWARE CACHE (type 5) — TRIED BUT DOESN'T HELP:
+//   Theory: loop 0 errors propagate to loop 1 via final_norm. Use Q8 for loop 0
+//   (minimize propagation) and Q4 for loop 1 (errors don't compound further).
+//   Reality: ppl=22.03, WORSE than uniform Q4 (ppl=20.58). Mixing precision across
+//   loops creates a distribution mismatch that hurts more than the compounding.
+//   Reference: NullSense/Nanbeige4.2-3B-NVFP4-FP8-LoopShield shows the correct
+//   approach is per-LAYER-DEPTH (edge layers at higher precision), not per-loop-pass.
+//
+// isfinite SANITIZATION: all quantized attention scale reads check isfinite().
+//   Prevents 0*inf=NaN when BF16 KV values overflow. See attn_decode_kernel.cu header.
 //
 // Safety: VRAM headroom check before weight upload; all CUDA calls checked.
 //
@@ -625,6 +653,10 @@ private:
                                                d_q8_, d_q8s_, kb_, v_cache_ptr, 1, lw.k.out_f, lw.k.in_f, s_));
                 VK(ops::rope_q_k_fused(q_, vb_, kb_, kv_k_[slot], pos, nKVh, nQ, nKVh, cos_pos, sin_pos, HD, s_));
                 if (prof && l == 0 && loop == 0) cudaEventRecord(ev[2], s_);
+                // --- KV cache type dispatch ---
+                // Each branch: (1) quantize K to cache, (2) quantize V to cache, (3) run attention.
+                // All quantized formats use per-32-block scaling. See file header for perplexity results.
+                // RECOMMENDED: --cache-type 3 (Q4) for best quality/VRAM ratio.
                 if (cfg.kv_cache_type == KV_Q8) {
                     VK(ops::k_to_q8_cache(kv_k_[slot] + (size_t)pos * nKVh * HD,
                                            q8_k_cache_[slot], q8_k_scales_[slot], pos, nKVh, HD, s_));

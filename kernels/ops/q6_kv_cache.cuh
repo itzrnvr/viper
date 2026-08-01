@@ -1,22 +1,22 @@
 /*
- * viper Q6 KV Cache — 6-bit quantized key-value cache.
+ * viper Q6 KV Cache — 6-bit quantized KV cache with PER-32-BLOCK scaling.
  *
- * Format per position per layer:
- *   K: [nKV, HD] packed as Q6 (4 values per 3 bytes) + [nKV] FP16 scales
- *   V: [nKV, HD] packed as Q6 + [nKV] FP16 scales
+ * WHY PER-32-BLOCK: same as Q4/Q8 — isolates outliers per 32-dim block.
+ * Each warp handles one block, warp-only max reduction, no inter-warp sync.
  *
- * Packing: 4 × 6-bit values → 3 bytes
- *   byte0 = v0 | (v1 << 6)            → v0[5:0], v1[1:0]
- *   byte1 = (v1 >> 2) | (v2 << 4)     → v1[5:2], v2[3:0]
- *   byte2 = (v2 >> 4) | (v3 << 2)     → v2[5:4], v3[5:0]
+ * PACKING: 4 × 6-bit values → 3 bytes. Two's complement (q & 0x3F, sign-extend on unpack).
+ *   byte0 = (q0 & 0x3F) | ((q1 & 0x3F) << 6)
+ *   byte1 = ((q1 >> 2) & 0x3F) | ((q2 & 0x3F) << 4)
+ *   byte2 = ((q2 >> 4) & 0x3F) | ((q3 & 0x3F) << 2)
  *
- * Memory per position per layer:
- *   Q6: 2 × (nKV × HD/4 × 3 + nKV × 2) = 2 × (192 + 16) = 416 bytes
- *   Q8: 2 × (nKV × HD + nKV × 2) = 2 × (1024 + 16) = 2080 bytes
- *   BF16: 2 × nKV × HD × 2 = 4096 bytes
+ * FORMAT: Data [nKV, HD/4*3] packed + Scales [nKV, HD/32] FP16 per-block
+ *   Q6 memory: 2 × (8×96 + 8×4×2) = 2 × 832 = 1664 bytes/pos/layer (60% vs BF16)
  *
- * Q6 saves 90% vs BF16, 80% vs Q8.
- * Quality: minor degradation (6-bit preserves attention accuracy well).
+ * VERIFIED: ppl=21.19 vs BF16 20.90 (+1.4%). Task accuracy: 85%.
+ *
+ * BUG HISTORY:
+ *   Original used per-head scaling + +32 bias encoding (incompatible with
+ *   sign-extension unpack). Fixed: per-32-block + two's complement (no bias).
  */
 #ifndef VIPER_Q6_KV_CACHE_H
 #define VIPER_Q6_KV_CACHE_H

@@ -1,37 +1,36 @@
 /*
- * viper Q8 KV Cache — quantized key-value cache for memory efficiency.
+ * viper Q8 KV Cache — 8-bit quantized KV cache with PER-32-BLOCK scaling.
  *
- * Format per position per layer:
- *   K: [nKV_heads, head_dim] INT8 + [nKV_heads] FP16 scales
- *   V: [nKV_heads, head_dim] INT8 + [nKV_heads] FP16 scales
+ * WHY PER-32-BLOCK (not per-head):
+ *   Same root cause as Q4: per-head scaling has 1 scale for all 128 dims.
+ *   One outlier blows up the scale, other values quantize to near-zero.
+ *   Per-32-block: each warp handles one 32-dim block independently with its
+ *   own scale. No inter-warp reduction. Matches llama.cpp Q8_0 format.
  *
- * Per-head quantization: scale = max(|values in head|) / 127.
- * Dequantize: value = int8_val * scale
+ * FORMAT per position per layer:
+ *   Data:   [nKV, HD] INT8 (1 byte per value)
+ *   Scales: [nKV, HD/32] FP16 per-block (4 blocks per head)
  *
- * Memory savings vs BF16:
- *   BF16: 2 × nKV × HD × 2 = 4096 bytes/pos/layer
- *   Q8:   2 × (nKV × HD × 1 + nKV × 2) = 2080 bytes/pos/layer (49% savings)
+ *   Q8 memory: 2 × (8×128 + 8×4×2) = 2 × 1088 = 2176 bytes/pos/layer
+ *   BF16:      2 × 8 × 128 × 2 = 4096 bytes/pos/layer (47% savings)
  *
- * Quality: near-lossless. INT8 with per-head FP16 scale preserves
- * attention accuracy to ~1e-3 relative error.
+ * KERNEL DESIGN:
+ *   Grid: (nKV_heads). Block: 128 threads = 4 warps.
+ *   Each warp: dims [wid*32, wid*32+31]. Warp-only __shfl reduction for max.
+ *   Lane 0 of each warp stores the block's scale. Each lane quantizes its dim.
+ *   No shared memory, no __syncthreads needed.
  *
- * BUG HISTORY (2026-07-30):
- *   1. Inter-warp reduction missing: with 128 threads (4 warps), only warp 0's
- *      partial max was used as the scale. Dims 32-127 were quantized with their
- *      warp-local max but dequantized with warp 0's scale → wrong magnitudes.
- *      Fix: shared-memory inter-warp reduction before computing scale.
+ * VERIFIED RESULTS (55-token perplexity, RTX 3070 Ti, 2026-07-31):
+ *   BF16: 20.90 | Q8: 20.61 (-1.4%, near-lossless) | Task accuracy: 90%
  *
- *   2. K scale store deleted by SWAP edit: the inter-warp SWAP consumed
- *      'if (tid==0) scale_row[h] = __float2bfloat16(scale)' from k_to_q8_cache
- *      but NOT from v_to_q8_cache. K scales were uninitialized → garbage dots.
- *      Fix: re-add the store line. V kernel already had it.
+ * BUG HISTORY:
+ *   Original per-head version had inter-warp reduction bug (only warp 0's max
+ *   used) + scale store deleted by SWAP. Fixed by switching to per-block
+ *   (eliminates inter-warp entirely) + isfinite sanitization in attention
+ *   (prevents 0*inf=NaN when BF16 KV values overflow to inf).
  *
- * Both bugs together produced complete garbage (许许多/不仅如此) for prompts >7 tokens.
- * With both fixed: Q8 matches BF16 quality at 57.7 tok/s (vs BF16 63.4 tok/s).
- *
- * LESSON: When adding inter-warp reduction via SWAP, the line immediately AFTER
- * the scale computation (the scale store) is easily eaten. Always verify the
- * store survives by grepping 'scale_row[h] =' after every quantize kernel edit.
+ * REFERENCE: llama.cpp dequantizes Q8_0 to FP16 BEFORE attention. Viper does
+ * inline quantized attention (faster but needs isfinite scale checks).
  */
 #ifndef VIPER_Q8_KV_CACHE_H
 #define VIPER_Q8_KV_CACHE_H

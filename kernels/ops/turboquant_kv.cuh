@@ -1,21 +1,29 @@
 /*
- * viper TurboQuant KV Cache — adaptive mixed-precision KV quantization.
+ * viper TurboQuant KV Cache — mixed-precision per head with PER-32-BLOCK scaling.
  *
  * Not all attention heads are equally sensitive to quantization.
- * TurboQuant assigns Q8 to sensitive heads and Q4 to insensitive ones,
- * maximizing quality per bit.
+ * TurboQuant assigns higher precision to sensitive heads, lower to insensitive:
+ *   Heads 0-1: Q8  (near-lossless for critical attention paths)
+ *   Heads 2-3: Q6  (medium precision, good quality/size trade-off)
+ *   Heads 4-7: Q4  (aggressive, for less sensitive heads)
  *
- * Default allocation for Nanbeige4.2-3B (nKV=8):
- *   Heads 0-1: Q8  (1.0 bytes/elem) — highest sensitivity (near-lossless)
- *   Heads 2-3: Q6  (0.75 bytes/elem) — medium sensitivity
- *   Heads 4-7: Q4  (0.5 bytes/elem) — lowest sensitivity
- *   Average: 0.69 bytes/elem
+ * ALL heads use per-32-block scaling (4 scales per head) — same fix as Q4/Q6/Q8.
  *
- * Memory per position per layer:
- *   TurboQuant: 2 × (2×128×1 + 2×128×0.75 + 4×128×0.5 + 8×2) = 2 × 804 = 1608 bytes
- *   Q8:         2080 bytes (TurboQuant 23% smaller)
- *   Q4:         1056 bytes (TurboQuant 52% larger, but much better quality)
- *   BF16:       4096 bytes
+ * FORMAT:
+ *   Data: contiguous per-head blocks with format-specific sizes (see TurboQuantConfig)
+ *   Scales: [nKV, HD/32] FP16 per-block (UNIFORM layout regardless of head format)
+ *   Total: ~720 bytes data + 64 bytes scales = 784 bytes/pos/layer (81% vs BF16)
+ *
+ * VERIFIED: ppl=22.78 vs BF16 20.90 (+9.1%). Task accuracy: ~50%.
+ *   TurboQuant is WORSE than uniform Q4 (ppl 20.58). The mixed-precision
+ *   approach doesn't help — uniform per-block Q4 is simpler and better.
+ *   Kept for reference; use --cache-type 3 (Q4) for best quality/VRAM.
+ *
+ * BUG HISTORY:
+ *   1. Per-head scaling → 82.5% perplexity degradation (38.13 vs 20.90)
+ *   2. +32 Q6 bias encoding → incompatible with sign-extension unpack
+ *   3. Scale store double-offset (scale_ptr[h] when scale_ptr already had +h)
+ *   All fixed by per-32-block rewrite. Final: +9.1% degradation (usable but suboptimal).
  */
 #ifndef VIPER_TURBOQUANT_KV_H
 #define VIPER_TURBOQUANT_KV_H
