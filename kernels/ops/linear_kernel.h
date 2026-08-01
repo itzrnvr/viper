@@ -105,6 +105,12 @@ cudaError_t linear_q4_g64_bf16_residual_swiglu(
     const __nv_bfloat16* gate, const __nv_bfloat16* up,
     __nv_bfloat16* y, const __nv_bfloat16* residual,
     int M, int N, int K, cudaStream_t stream);
+// FUSED: residual + rmsnorm + GEMV (norm(x + residual) then GEMV). Saves 88 HBM ops/forward.
+cudaError_t dp4a_q4_g64_bf16_rmsnorm_residual(
+    const uint8_t* w, const __nv_bfloat16* s,
+    const __nv_bfloat16* gamma, float eps,
+    const __nv_bfloat16* x, const __nv_bfloat16* residual,
+    __nv_bfloat16* y, int M, int N, int K, cudaStream_t stream);
 }  // namespace ops
 }  // namespace viper
 

@@ -49,7 +49,7 @@ __global__ void dp4a_q4_v3_kernel(
             float u = __bfloat162float(swiglu_up[i]);
             xbf[i] = __float2bfloat16(g / (1.0f + __expf(-g)) * u);
         } else {
-            xbf[i] = x_global[i];
+            float _val = __bfloat162float(x_global[i]); if (gamma && residual) _val += __bfloat162float(residual[(size_t)m * K + i]); xbf[i] = __float2bfloat16(_val);
         }
     }
 
@@ -155,7 +155,7 @@ __global__ void dp4a_q4_v3_kernel(
         acc += __shfl_xor_sync(0xffffffff, acc, off);
 
     if (lane_id == 0) {
-        if (residual)
+        if (residual && !gamma)
             acc += __bfloat162float(residual[m * N + n]);
         y[m * N + n] = __float2bfloat16(acc);
     }
@@ -199,6 +199,20 @@ cudaError_t dp4a_q4_g64_bf16_residual_swiglu(
     size_t smem = K + K/64*2 + 128 + K*2;
     dp4a_q4_v3_kernel<<<(N+7)/8, 256, smem, stream>>>(
         w, s, gate, y, residual, M, N, K, nullptr, 0.0f, up);
+    return cudaGetLastError();
+}
+
+// FUSED: residual + rmsnorm + GEMV in ONE kernel (norm(x + residual) then GEMV)
+// Replaces: residual_add + rmsnorm + GEMV = 3 launches -> 1 launch
+// Saves: 2 HBM reads + 2 HBM writes per layer (88 total per forward pass)
+cudaError_t dp4a_q4_g64_bf16_rmsnorm_residual(
+    const uint8_t* w, const __nv_bfloat16* s,
+    const __nv_bfloat16* gamma, float eps,
+    const __nv_bfloat16* x, const __nv_bfloat16* residual,
+    __nv_bfloat16* y, int M, int N, int K, cudaStream_t stream) {
+    size_t smem = K + K/64*2 + 128 + K*2;
+    dp4a_q4_v3_kernel<<<(N+7)/8, 256, smem, stream>>>(
+        w, s, x, y, residual, M, N, K, gamma, eps, nullptr);
     return cudaGetLastError();
 }
 
